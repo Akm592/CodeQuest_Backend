@@ -1,5 +1,5 @@
 # Supabase client initialization and functions
-from typing import Optional
+from typing import Optional, List
 from supabase import create_client, Client
 from app.core.config import settings
 from app.core.logger import logger
@@ -10,6 +10,7 @@ class SupabaseManager:
 
     @classmethod
     def get_client(cls) -> Client:
+        """Initialize and return the Supabase client."""
         if cls._client is None:
             try:
                 cls._client = create_client(
@@ -18,51 +19,100 @@ class SupabaseManager:
                 logger.info("Successfully connected to Supabase.")
             except Exception as e:
                 logger.error(f"Failed to initialize Supabase client: {e}")
-                raise  # Re-raise to prevent app from starting without DB
+                raise
         return cls._client
 
-    @staticmethod
-    async def store_message(
-        session_id: str,
-        sender_type: str,  # Changed from user_message/bot_message to sender_type
-        content: str,  # Changed from user_message/bot_message to content
-        intent: Optional[str] = None,
-        visualization_data: Optional[dict] = None,
-        parent_message_id: Optional[str] = None,  # Added parent_message_id
-        metadata: Optional[dict] = None,  # Added metadata
-    ):
-        supabase_client = SupabaseManager.get_client()
+    @classmethod
+    async def create_chat_session(
+        cls, user_id: str, session_id: str, session_name: str = "New Chat"
+    ) -> bool:
+        """Create a new chat session in the database."""
+        try:
+            cls.get_client().table("chat_sessions").insert(
+                {
+                    "session_id": session_id,
+                    "user_id": user_id,
+                    "session_name": session_name,
+                }
+            ).execute()
+            return True
+        except Exception as e:
+            logger.error(f"Error creating chat session: {str(e)}")
+            return False
+
+    @classmethod
+    async def get_chat_sessions_for_user(cls, user_id: str) -> Optional[List[dict]]:
+        """Retrieve all chat sessions for a given user."""
         try:
             response = (
-                await supabase_client.table(
-                    "messages"
-                )  # Changed table name to 'messages'
-                .insert(
-                    {
-                        "session_id": session_id,
-                        "sender_type": sender_type,  # Using sender_type directly
-                        "content": content,  # Using content directly
-                        "intent": intent,
-                        "visualization_data": visualization_data,
-                        "parent_message_id": parent_message_id,  # Include parent_message_id
-                        "metadata": metadata,  # Include metadata
-                    }
-                )
+                cls.get_client()
+                .table("chat_sessions")
+                .select("*")
+                .eq("user_id", user_id)
                 .execute()
             )
+            return response.data
+        except Exception as e:
+            logger.error(f"Error retrieving chat sessions: {str(e)}")
+            return None
+
+    @classmethod
+    async def get_messages_by_session_id(cls, session_id: str) -> Optional[List[dict]]:
+        """Retrieve all messages for a given session."""
+        try:
+            response = (
+                cls.get_client()
+                .table("messages")
+                .select("*")
+                .eq("session_id", session_id)
+                .execute()
+            )
+            return response.data
+        except Exception as e:
+            logger.error(f"Error retrieving messages: {str(e)}")
+            return None
+
+    @classmethod
+    async def update_chat_session_name(cls, session_id: str, session_name: str) -> bool:
+        """Update the name of a chat session."""
+        try:
+            cls.get_client().table("chat_sessions").update(
+                {"session_name": session_name}
+            ).eq("session_id", session_id).execute()
+            return True
+        except Exception as e:
+            logger.error(f"Error updating session name: {str(e)}")
+            return False
+
+    @classmethod
+    async def store_message(
+        cls,
+        session_id: str,
+        sender_type: str,
+        content: str,
+        intent: Optional[str] = None,
+        visualization_data: Optional[dict] = None,
+        parent_message_id: Optional[str] = None,
+        metadata: Optional[dict] = None,
+    ) -> bool:
+        """Store a message in the database."""
+        try:
+            message_data = {
+                "session_id": session_id,
+                "sender_type": sender_type,
+                "content": content,
+                "intent": intent,
+                "visualization_data": visualization_data,
+                "parent_message_id": parent_message_id,
+                "metadata": metadata or {},
+            }
+
+            response = cls.get_client().table("messages").insert(message_data).execute()
 
             if response.error:
-                logger.error(
-                    f"Error storing message in Supabase (messages table): {response.error}"  # Updated error message
-                )
+                logger.error(f"Error storing message: {response.error}")
                 return False
             return True
         except Exception as e:
-            logger.error(
-                f"Exception while storing message in messages table: {e}"
-            )  # Updated error message
+            logger.error(f"Exception storing message: {str(e)}")
             return False
-
-
-# Example Usage (you can access the client using SupabaseManager.get_client())
-# supabase = SupabaseManager.get_client()

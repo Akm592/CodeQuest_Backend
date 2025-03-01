@@ -7,6 +7,7 @@ from app.memory.chat_memory import ChatMemory
 from app.database.supabase_client import SupabaseManager
 from app.rag import rag_engine
 from typing import Optional, Dict, Any
+from app.core.logger import logger
 
 router = APIRouter()
 chat_memory = (
@@ -52,7 +53,9 @@ async def chat_endpoint(chat_request: ChatRequest, request: Request):
     # Get session ID from request header
     session_id = request.headers.get("X-Session-ID")
     if not session_id:
-        session_id = "default_session"  # Fallback if no session ID provided
+        raise HTTPException(
+            status_code=400, detail="X-Session-ID header is missing"
+        )  # Error if no session ID
 
     # Get chat session and previous context
     chat_session = chat_memory.get_session(session_id)
@@ -61,7 +64,7 @@ async def chat_endpoint(chat_request: ChatRequest, request: Request):
     # Adjust context_window_size as needed (e.g., 5-10 messages)
     previous_messages = chat_session.get_history(context_window_size=5)
 
-    # Now add the current user message to history
+    # Now add the current user message to history (in memory)
     chat_session.add_message("user", user_input)
 
     intent = classify_intent(user_input)
@@ -92,17 +95,30 @@ async def chat_endpoint(chat_request: ChatRequest, request: Request):
             user_input, system_prompt, previous_messages
         )
 
-    # Store the bot response in chat history
+    # Store the bot response in chat history (in memory)
     chat_session.add_message("bot", bot_response)
 
-    # Store chat history in Supabase
-    await SupabaseManager.store_chat_history(
+    # Store user message in Supabase 'messages' table
+    await SupabaseManager.store_message(
         session_id=session_id,
-        user_message=user_input,
-        bot_message=bot_response,
+        sender_type="user",  # Set sender_type to 'user'
+        content=user_input,  # Use user_input as content
+        intent=intent,
+        visualization_data=None,  # No visualization data for user message
+        metadata={"from_frontend": True},  # Example metadata, can be expanded
+    )
+
+    # Store bot response in Supabase 'messages' table
+    message_stored = await SupabaseManager.store_message(
+        session_id=session_id,
+        sender_type="bot",  # Set sender_type to 'bot'
+        content=bot_response,  # Use bot_response as content
         intent=intent,
         visualization_data=visualization_data,
+        metadata={"response_type": "LLM"},  # Example metadata, can be expanded
     )
+    if not message_stored:
+        logger.warning(f"Failed to store bot message in session {session_id}")
 
     return {
         "bot_response": bot_response,

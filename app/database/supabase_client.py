@@ -22,24 +22,30 @@ class SupabaseManager:
         return cls._client
 
     @staticmethod
-    async def store_chat_history(
+    async def store_message(
         session_id: str,
-        user_message: str,
-        bot_message: str,
-        intent: str,
+        sender_type: str,  # Changed from user_message/bot_message to sender_type
+        content: str,  # Changed from user_message/bot_message to content
+        intent: Optional[str] = None,
         visualization_data: Optional[dict] = None,
+        parent_message_id: Optional[str] = None,  # Added parent_message_id
+        metadata: Optional[dict] = None,  # Added metadata
     ):
         supabase_client = SupabaseManager.get_client()
         try:
             response = (
-                await supabase_client.table("chat_history")
+                await supabase_client.table(
+                    "messages"
+                )  # Changed table name to 'messages'
                 .insert(
                     {
                         "session_id": session_id,
-                        "user_message": user_message,
-                        "bot_message": bot_message,
+                        "sender_type": sender_type,  # Using sender_type directly
+                        "content": content,  # Using content directly
                         "intent": intent,
                         "visualization_data": visualization_data,
+                        "parent_message_id": parent_message_id,  # Include parent_message_id
+                        "metadata": metadata,  # Include metadata
                     }
                 )
                 .execute()
@@ -47,12 +53,14 @@ class SupabaseManager:
 
             if response.error:
                 logger.error(
-                    f"Error storing chat history in Supabase: {response.error}"
+                    f"Error storing message in Supabase (messages table): {response.error}"  # Updated error message
                 )
                 return False
             return True
         except Exception as e:
-            logger.error(f"Exception while storing chat history: {e}")
+            logger.error(
+                f"Exception while storing message in messages table: {e}"
+            )  # Updated error message
             return False
 
 

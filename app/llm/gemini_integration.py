@@ -27,7 +27,7 @@ chat_config = {
 
 # Initialize models
 visualization_model = genai.GenerativeModel(
-    "gemini-1.5-flash-8b",
+    "learnlm-1.5-pro-experimental", 
     generation_config=visualization_config,
 )
 chat_model = genai.GenerativeModel(

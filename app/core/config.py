@@ -13,6 +13,8 @@ class Settings:
     CORS_ORIGINS: list = [
         "http://localhost:3000",
         "http://localhost:5173",
+        "https://codequest101.vercel.app/",
+        
     ]  # Example origins
 
 

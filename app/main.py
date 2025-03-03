@@ -7,7 +7,7 @@ from app.core.config import settings
 from app.core.logger import logger
 from app.database.supabase_client import SupabaseManager
 
-app = FastAPI(title="AI Chatbot Backend")
+app = FastAPI(title="CodeQuest101 Chatbot Backend")
 
 # CORS middleware
 app.add_middleware(

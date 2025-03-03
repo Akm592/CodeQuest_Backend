@@ -10,8 +10,8 @@ COPY . /app
 # Install the dependencies listed in requirements.txt
 RUN pip install -r requirements.txt
 
-# Expose port 8000 to allow external access
+# Expose port 8000 to allow external access (optional, for documentation)
 EXPOSE 8000
 
-# Command to run the FastAPI application using Uvicorn
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Command to run the FastAPI application using Uvicorn with dynamic port
+CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port $PORT"]

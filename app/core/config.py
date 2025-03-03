@@ -10,12 +10,8 @@ class Settings:
     SUPABASE_URL: str = os.getenv("SUPABASE_URL")
     SUPABASE_ANON_KEY: str = os.getenv("SUPABASE_ANON_KEY")
     APP_LOG_FILE: str = "app.log"
-    CORS_ORIGINS: list = [
-        "http://localhost:3000",
-        "http://localhost:5173",
-        "https://codequest101.vercel.app/",
-        
-    ]  # Example origins
+    CORS_ORIGINS = os.getenv("CORS_ORIGINS", "").split(",")
+# Example origins
 
 
 settings = Settings()

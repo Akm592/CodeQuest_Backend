@@ -1,4 +1,3 @@
-
 # FastAPI app initialization
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -27,6 +26,7 @@ app.include_router(health.router)
 async def startup_event():
     logger.info("Starting up the application...")
     # Initialize Supabase client on startup (optional, can also be lazy-loaded)
+    logger.info(f"CORS_ORIGINS set to: {settings.CORS_ORIGINS}")
     SupabaseManager.get_client()  # Initialize Supabase client at startup
 
 

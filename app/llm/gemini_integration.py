@@ -1,5 +1,5 @@
-# Gemini API integration with chat history support
 import google.generativeai as genai
+from typing import AsyncGenerator
 from app.core.config import settings
 from app.core.logger import logger
 import json
@@ -27,7 +27,7 @@ chat_config = {
 
 # Initialize models
 visualization_model = genai.GenerativeModel(
-    "learnlm-1.5-pro-experimental", 
+    "learnlm-1.5-pro-experimental",
     generation_config=visualization_config,
 )
 chat_model = genai.GenerativeModel(
@@ -35,13 +35,11 @@ chat_model = genai.GenerativeModel(
     generation_config=chat_config,
 )
 
-
 def clean_json_response(raw_text: str) -> str:
     """Extract JSON from model response."""
     text = re.sub(r"```json\s*", "", raw_text)
     text = re.sub(r"```\s*$", "", text)
     return text.strip()
-
 
 async def get_visualization_data(user_query: str) -> Optional[Dict[str, Any]]:
     """Generate visualization data."""
@@ -56,42 +54,61 @@ async def get_visualization_data(user_query: str) -> Optional[Dict[str, Any]]:
         logger.error(f"Visualization error: {str(e)}")
         return None
 
-
 async def get_chat_response(
     user_query: str, system_prompt: str, chat_history: List[Dict[str, str]] = None
 ) -> str:
     """
-    Generate contextual text response with chat history.
+    Generate full text response with chat history (non-streaming).
 
     Args:
         user_query: The current user query
         system_prompt: System instructions for the model
-        chat_history: List of previous messages in the format [{"role": "user", "content": "..."}, {"role": "bot", "content": "..."}]
+        chat_history: List of previous messages [{"role": "user", "content": "..."}, ...]
     """
     try:
-        # Start a chat session
         chat = chat_model.start_chat(history=[])
-
-        # Add system prompt as the first message
         if system_prompt:
             await chat.send_message_async(system_prompt)
-
-        # Add chat history if provided
-        if chat_history and len(chat_history) > 0:
+        if chat_history:
             for message in chat_history:
                 role = "user" if message["role"] == "user" else "model"
-                content = message["content"]
-
-                # Add each historical message to the chat
                 if role == "user":
-                    await chat.send_message_async(content)
+                    await chat.send_message_async(message["content"])
                 else:
-                    # We need to manually add bot responses to the history
-                    chat.history.append({"role": "model", "parts": [content]})
-
-        # Send the current user query and get the response
+                    chat.history.append({"role": "model", "parts": [message["content"]]})
         response = await chat.send_message_async(user_query)
         return response.text.strip()
     except Exception as e:
         logger.error(f"Chat error: {str(e)}")
         return "I couldn't generate a response. Please try again."
+
+async def stream_chat_response(
+    user_query: str, system_prompt: str, chat_history: List[Dict[str, str]] = None
+) -> AsyncGenerator[str, None]:
+    """
+    Stream text response chunks with chat history.
+
+    Args:
+        user_query: The current user query
+        system_prompt: System instructions for the model
+        chat_history: List of previous messages [{"role": "user", "content": "..."}, ...]
+    """
+    try:
+        # Construct contents list
+        contents = []
+        if system_prompt:
+            contents.append({"role": "user", "parts": [system_prompt]})
+        if chat_history:
+            for msg in chat_history:
+                role = "user" if msg["role"] == "user" else "model"
+                contents.append({"role": role, "parts": [msg["content"]]})
+        contents.append({"role": "user", "parts": [user_query]})
+
+        # Stream response
+        response = await chat_model.generate_content_async(contents, stream=True)
+        async for chunk in response:
+            logger.debug(f"Response chunk: {chunk.text}")
+            yield chunk.text
+    except Exception as e:
+        logger.error(f"Streaming error: {str(e)}")
+        yield "Error generating response."

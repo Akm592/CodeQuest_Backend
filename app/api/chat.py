@@ -1,18 +1,18 @@
-# Chat endpoint logic with conversation context
 from fastapi import APIRouter, HTTPException, Depends, Request
-from app.schemas.chat_schemas import ChatRequest, ChatResponse
+from fastapi.responses import StreamingResponse
+from app.schemas.chat_schemas import ChatRequest
 from app.llm import gemini_integration
 from app.llm.prompts import GENERAL_PROMPT, CS_TUTOR_PROMPT
 from app.memory.chat_memory import ChatMemory
 from app.database.supabase_client import SupabaseManager
 from app.rag import rag_engine
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, AsyncGenerator
 import uuid
+import json
 from app.core.logger import logger
 
 router = APIRouter()
-chat_memory = ChatMemory()  # In-memory chat memory
-
+chat_memory = ChatMemory()
 
 def classify_intent(query: str) -> str:
     """Determine the intent of the user query."""
@@ -32,7 +32,6 @@ def classify_intent(query: str) -> str:
         "define",
         "information about",
     }
-
     if any(kw in query_lower for kw in vis_keywords):
         return "visualization"
     elif any(kw in query_lower for kw in cs_keywords):
@@ -42,8 +41,61 @@ def classify_intent(query: str) -> str:
     else:
         return "general"
 
+async def stream_response(
+    intent: str,
+    user_input: str,
+    session_id: str,
+    chat_session,
+    chat_history: List[Dict[str, str]]
+) -> AsyncGenerator[str, None]:
+    """
+    Generate streaming response as SSE events.
+    """
+    bot_response = ""
+    vis_data = None
+    try:
+        if intent == "visualization":
+            vis_data = await gemini_integration.get_visualization_data(user_input)
+            if vis_data:
+                yield f"data: {json.dumps({'type': 'visualization', 'data': vis_data})}\n\n"
+            async for chunk in gemini_integration.stream_chat_response(
+                user_input, CS_TUTOR_PROMPT, chat_history
+            ):
+                logger.debug(f"Text chunk: {chunk}")
+                bot_response += chunk
+                yield f"data: {json.dumps({'type': 'text', 'content': chunk})}\n\n"
+        elif intent == "rag":
+            context = await rag_engine.retrieve_relevant_context(user_input)
+            response = await rag_engine.generate_rag_response(
+                user_input, context, chat_history
+            ) if context else "I'm sorry, I cannot find relevant information."
+            bot_response = response
+            logger.debug(f"RAG response: {response}")
+            yield f"data: {json.dumps({'type': 'text', 'content': response})}\n\n"
+        else:  # "cs_tutor" or "general"
+            system_prompt = CS_TUTOR_PROMPT if intent == "cs_tutor" else GENERAL_PROMPT
+            async for chunk in gemini_integration.stream_chat_response(
+                user_input, system_prompt, chat_history
+            ):
+                logger.debug(f"Text chunk: {chunk}")
+                bot_response += chunk
+                yield f"data: {json.dumps({'type': 'text', 'content': chunk})}\n\n"
+    finally:
+        # Add bot response to chat history
+        chat_session.add_message("bot", bot_response)
+        # Store bot message in Supabase
+        await SupabaseManager.store_message(
+            session_id=session_id,
+            sender_type="bot",
+            content=bot_response,
+            intent=intent,
+            visualization_data=vis_data,
+            metadata={"response_type": "LLM"},
+        )
+        logger.info(f"Full bot response for session {session_id}: {bot_response}")
+        # Note: Token usage logging is omitted as it's not directly available in streaming mode
 
-@router.post("/chat", response_model=ChatResponse)
+@router.post("/chat")
 async def chat_endpoint(chat_request: ChatRequest, request: Request):
     user_input = chat_request.user_input.strip()
     if not user_input:
@@ -53,62 +105,19 @@ async def chat_endpoint(chat_request: ChatRequest, request: Request):
     if not session_id_header:
         raise HTTPException(status_code=400, detail="X-Session-ID header is missing")
     try:
-        session_id = uuid.UUID(session_id_header)  # Validate UUID format
+        session_id = str(uuid.UUID(session_id_header))
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid X-Session-ID format")
 
-    # Get chat session and previous context (from in-memory for now)
-    chat_session = chat_memory.get_session(str(session_id))
-    previous_messages = chat_session.get_history(context_window_size=5)
-    chat_session.add_message(
-        "user", user_input
-    )  # Add user message to in-memory history
+    # Get chat session and history
+    chat_session = chat_memory.get_session(session_id)
+    chat_history = chat_session.get_history(context_window_size=5)
+    chat_session.add_message("user", user_input)
 
+    # Store user message
     intent = classify_intent(user_input)
-    visualization_data: Optional[Dict[str, Any]] = None
-    system_prompt = GENERAL_PROMPT
-    bot_response = ""
-
-    if intent == "visualization":
-        visualization_data = await gemini_integration.get_visualization_data(user_input)
-        system_prompt = CS_TUTOR_PROMPT
-    elif intent == "cs_tutor":
-        system_prompt = CS_TUTOR_PROMPT
-    elif intent == "rag":
-        context = await rag_engine.retrieve_relevant_context(user_input)
-        if context:
-            bot_response = await rag_engine.generate_rag_response(
-                user_input, context, previous_messages
-            )
-        else:
-            bot_response = "I'm sorry, I cannot find relevant information in my knowledge base to answer your question."
-    else:  # intent == "general"
-        pass
-
-    if not bot_response and intent != "rag":
-        bot_response = await gemini_integration.get_chat_response(
-            user_input, system_prompt, previous_messages
-        )
-    chat_session.add_message(
-        "bot", bot_response
-    )  # Add bot response to in-memory history
-
-    # Store user message in Supabase
-    first_user_message = False
-    session_name = None
-    messages_in_session_response = await SupabaseManager.get_messages_by_session_id(
-        str(session_id)
-    )
-    if messages_in_session_response is None or len(messages_in_session_response) == 0:
-        first_user_message = True
-        session_name = user_input.split()[:3]  # First 3 words
-        session_name = " ".join(session_name) if session_name else "New Chat"
-        await SupabaseManager.update_chat_session_name(
-            str(session_id), session_name
-        )  # Set session name
-
     await SupabaseManager.store_message(
-        session_id=str(session_id),
+        session_id=session_id,
         sender_type="user",
         content=user_input,
         intent=intent,
@@ -116,22 +125,17 @@ async def chat_endpoint(chat_request: ChatRequest, request: Request):
         metadata={"from_frontend": True},
     )
 
-    message_stored = await SupabaseManager.store_message(
-        session_id=str(session_id),
-        sender_type="bot",
-        content=bot_response,
-        intent=intent,
-        visualization_data=visualization_data,
-        metadata={"response_type": "LLM"},
-    )
-    if not message_stored:
-        logger.warning(f"Failed to store bot message in session {session_id}")
+    # Handle first message session naming
+    messages_in_session = await SupabaseManager.get_messages_by_session_id(session_id)
+    if not messages_in_session:
+        session_name = " ".join(user_input.split()[:3]) or "New Chat"
+        await SupabaseManager.update_chat_session_name(session_id, session_name)
 
-    return {
-        "bot_response": bot_response,
-        "visualization_data": visualization_data,
-        "response_type": "visualization" if visualization_data else "text",
-    }
+    # Return streaming response
+    return StreamingResponse(
+        stream_response(intent, user_input, session_id, chat_session, chat_history),
+        media_type="text/event-stream"
+    )
 
 
 @router.post("/sessions", response_model=dict)  # POST to create new session

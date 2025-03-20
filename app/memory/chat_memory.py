@@ -1,19 +1,23 @@
-# Chat memory management
-from typing import Dict, List, Optional
-
+# app/memory/chat_memory.py
+from typing import Dict, List, Optional, Any
 
 class ChatSession:
     def __init__(self, session_id: str):
         self.session_id = session_id
-        self.history: List[Dict[str, str]] = []  # Store history as list of turns
+        self.history: List[Dict[str, str]] = []
+        self.state: Dict[str, Any] = {}  # Added state dictionary
 
     def add_message(self, role: str, content: str):
         self.history.append({"role": role, "content": content})
 
     def get_history(self, context_window_size: int = 5) -> List[Dict[str, str]]:
-        """Returns the most recent messages within the context window."""
         return self.history[-context_window_size:]
 
+    def set_state(self, key: str, value: Any):
+        self.state[key] = value
+
+    def get_state(self, key: str, default: Any = None) -> Any:
+        return self.state.get(key, default)
 
 class ChatMemory:
     def __init__(self):

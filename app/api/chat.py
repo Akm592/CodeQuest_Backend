@@ -1,3 +1,4 @@
+# app/routers/chat.py
 from fastapi import APIRouter, HTTPException, Depends, Request
 from fastapi.responses import StreamingResponse
 from app.schemas.chat_schemas import ChatRequest
@@ -6,10 +7,11 @@ from app.llm.prompts import GENERAL_PROMPT, CS_TUTOR_PROMPT
 from app.memory.chat_memory import ChatMemory
 from app.database.supabase_client import SupabaseManager
 from app.rag import rag_engine
-from typing import Optional, Dict, Any, List, AsyncGenerator
+from typing import Dict, Any, List, AsyncGenerator
 import uuid
 import json
 from app.core.logger import logger
+from app.scrapers.leetcode_scraper import scrape_leetcode_question
 
 router = APIRouter()
 chat_memory = ChatMemory()
@@ -26,12 +28,7 @@ def classify_intent(query: str) -> str:
         "how to",
         "example",
     }
-    rag_keywords = {
-        "what is",
-        "explain",
-        "define",
-        "information about",
-    }
+    rag_keywords = {"what is", "explain", "define", "information about"}
     if any(kw in query_lower for kw in vis_keywords):
         return "visualization"
     elif any(kw in query_lower for kw in cs_keywords):
@@ -42,58 +39,106 @@ def classify_intent(query: str) -> str:
         return "general"
 
 async def stream_response(
-    intent: str,
     user_input: str,
     session_id: str,
     chat_session,
     chat_history: List[Dict[str, str]]
 ) -> AsyncGenerator[str, None]:
     """
-    Generate streaming response as SSE events.
+    Generate streaming response as SSE events, handling LeetCode scraping and solution generation.
     """
-    bot_response = ""
-    vis_data = None
-    try:
-        if intent == "visualization":
-            vis_data = await gemini_integration.get_visualization_data(user_input)
-            if vis_data:
-                yield f"data: {json.dumps({'type': 'visualization', 'data': vis_data})}\n\n"
+    # Check if awaiting language input
+    if chat_session.get_state("awaiting_language"):
+        language = user_input.strip()
+        scraped_question = chat_session.get_state("scraped_question")
+        if not scraped_question:
+            response = "Error: No scraped question found."
+            yield f"data: {json.dumps({'type': 'text', 'content': response})}\n\n"
+            chat_session.add_message("bot", response)
+            await SupabaseManager.store_message(
+                session_id=session_id,
+                sender_type="bot",
+                content=response,
+                intent="cs_tutor",
+                visualization_data=None,
+                metadata={"response_type": "error"}
+            )
+        else:
+            prompt = f"Provide a solution to the following LeetCode question in {language}:\n{scraped_question}"
+            bot_response = ""
             async for chunk in gemini_integration.stream_chat_response(
-                user_input, CS_TUTOR_PROMPT, chat_history
+                prompt, CS_TUTOR_PROMPT, chat_history
             ):
-                logger.debug(f"Text chunk: {chunk}")
                 bot_response += chunk
                 yield f"data: {json.dumps({'type': 'text', 'content': chunk})}\n\n"
-        elif intent == "rag":
-            context = await rag_engine.retrieve_relevant_context(user_input)
-            response = await rag_engine.generate_rag_response(
-                user_input, context, chat_history
-            ) if context else "I'm sorry, I cannot find relevant information."
-            bot_response = response
-            logger.debug(f"RAG response: {response}")
+            chat_session.add_message("bot", bot_response)
+            chat_session.set_state("awaiting_language", False)
+            chat_session.set_state("scraped_question", None)  # Clear state
+            await SupabaseManager.store_message(
+                session_id=session_id,
+                sender_type="bot",
+                content=bot_response,
+                intent="cs_tutor",
+                visualization_data=None,
+                metadata={"response_type": "LLM"}
+            )
+    else:
+        # Check if input is a LeetCode question identifier
+        scraped_data = await scrape_leetcode_question(user_input)
+        if scraped_data:
+            chat_session.set_state("awaiting_language", True)
+            chat_session.set_state("scraped_question", scraped_data)
+            response = "I have the LeetCode question details. In what programming language would you like the solution?"
             yield f"data: {json.dumps({'type': 'text', 'content': response})}\n\n"
-        else:  # "cs_tutor" or "general"
+            chat_session.add_message("bot", response)
+            await SupabaseManager.store_message(
+                session_id=session_id,
+                sender_type="bot",
+                content=response,
+                intent="cs_tutor",
+                visualization_data=None,
+                metadata={"response_type": "LLM"}
+            )
+        else:
+            # Regular chat logic
+            intent = classify_intent(user_input)
+            bot_response = ""
+            vis_data = None
+            if intent == "visualization":
+                vis_data = await gemini_integration.get_visualization_data(user_input)
+                if vis_data:
+                    yield f"data: {json.dumps({'type': 'visualization', 'data': vis_data})}\n\n"
             system_prompt = CS_TUTOR_PROMPT if intent == "cs_tutor" else GENERAL_PROMPT
             async for chunk in gemini_integration.stream_chat_response(
                 user_input, system_prompt, chat_history
             ):
-                logger.debug(f"Text chunk: {chunk}")
                 bot_response += chunk
                 yield f"data: {json.dumps({'type': 'text', 'content': chunk})}\n\n"
-    finally:
-        # Add bot response to chat history
-        chat_session.add_message("bot", bot_response)
-        # Store bot message in Supabase
-        await SupabaseManager.store_message(
-            session_id=session_id,
-            sender_type="bot",
-            content=bot_response,
-            intent=intent,
-            visualization_data=vis_data,
-            metadata={"response_type": "LLM"},
-        )
-        logger.info(f"Full bot response for session {session_id}: {bot_response}")
-        # Note: Token usage logging is omitted as it's not directly available in streaming mode
+            chat_session.add_message("bot", bot_response)
+            await SupabaseManager.store_message(
+                session_id=session_id,
+                sender_type="bot",
+                content=bot_response,
+                intent=intent,
+                visualization_data=vis_data,
+                metadata={"response_type": "LLM"}
+            )
+
+@router.post("/scrape_leetcode")
+async def scrape_leetcode_endpoint(request: Request):
+    """
+    Endpoint to scrape a LeetCode question given an identifier (URL, name, or number).
+    """
+    body = await request.json()
+    identifier = body.get("identifier")
+    if not identifier:
+        raise HTTPException(status_code=400, detail="Missing 'identifier' in request body")
+    
+    scraped_data = await scrape_leetcode_question(identifier)
+    if not scraped_data:
+        raise HTTPException(status_code=404, detail="Failed to scrape LeetCode question or question not found")
+    
+    return {"question_details": scraped_data}
 
 @router.post("/chat")
 async def chat_endpoint(chat_request: ChatRequest, request: Request):
@@ -109,7 +154,6 @@ async def chat_endpoint(chat_request: ChatRequest, request: Request):
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid X-Session-ID format")
 
-    # Get chat session and history
     chat_session = chat_memory.get_session(session_id)
     chat_history = chat_session.get_history(context_window_size=5)
     chat_session.add_message("user", user_input)
@@ -122,7 +166,7 @@ async def chat_endpoint(chat_request: ChatRequest, request: Request):
         content=user_input,
         intent=intent,
         visualization_data=None,
-        metadata={"from_frontend": True},
+        metadata={"from_frontend": True}
     )
 
     # Handle first message session naming
@@ -131,35 +175,28 @@ async def chat_endpoint(chat_request: ChatRequest, request: Request):
         session_name = " ".join(user_input.split()[:3]) or "New Chat"
         await SupabaseManager.update_chat_session_name(session_id, session_name)
 
-    # Return streaming response
     return StreamingResponse(
-        stream_response(intent, user_input, session_id, chat_session, chat_history),
+        stream_response(user_input, session_id, chat_session, chat_history),
         media_type="text/event-stream"
     )
 
-
-@router.post("/sessions", response_model=dict)  # POST to create new session
+# Existing endpoints remain unchanged
+@router.post("/sessions", response_model=dict)
 async def create_chat_session_endpoint(request: Request):
-    user_id = "user_placeholder"  # Replace with actual user ID retrieval from auth context/headers
-    new_session_id = uuid.uuid4()  # Generate new UUID for session
+    user_id = "user_placeholder"
+    new_session_id = uuid.uuid4()
     success = await SupabaseManager.create_chat_session(user_id, str(new_session_id))
     if not success:
-        raise HTTPException(
-            status_code=500, detail="Failed to create new chat session in database"
-        )
+        raise HTTPException(status_code=500, detail="Failed to create new chat session")
     return {"session_id": str(new_session_id)}
 
-
-@router.get("/sessions", response_model=List[dict])  # GET to list sessions
+@router.get("/sessions", response_model=List[dict])
 async def get_chat_sessions_endpoint(request: Request):
-    user_id = "user_placeholder"  # Replace with actual user ID retrieval
+    user_id = "user_placeholder"
     sessions = await SupabaseManager.get_chat_sessions_for_user(user_id)
     return sessions if sessions else []
 
-
-@router.get(
-    "/sessions/{session_id}/messages", response_model=List[dict]
-)  # GET messages for a session
+@router.get("/sessions/{session_id}/messages", response_model=List[dict])
 async def get_session_messages_endpoint(session_id: str, request: Request):
     messages = await SupabaseManager.get_messages_by_session_id(session_id)
     return messages if messages else []

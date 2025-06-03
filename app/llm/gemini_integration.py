@@ -27,11 +27,11 @@ chat_config = {
 
 # Initialize models
 visualization_model = genai.GenerativeModel(
-    "learnlm-1.5-pro-experimental",
+    "gemini-2.0-flash-lite",
     generation_config=visualization_config,
 )
 chat_model = genai.GenerativeModel(
-    "learnlm-1.5-pro-experimental",
+    "gemini-2.0-flash-lite",
     generation_config=chat_config,
 )
 

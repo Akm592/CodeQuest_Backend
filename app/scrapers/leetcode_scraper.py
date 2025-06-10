@@ -366,9 +366,8 @@ async def scrape_leetcode_question(identifier: str) -> Optional[str]:
     title_slug = await get_title_slug(identifier)
     if not title_slug:
         # get_title_slug already logged the failure reason
-
-
-    # fetch_leetcode_question will fetch details and log its own success/failure
+        return None
+    
     return await fetch_leetcode_question(title_slug)
 
 
@@ -613,4 +612,5 @@ async def scrape_leetcode_question(identifier: str) -> Optional[Dict[str, Any]]:
     """
     title_slug = await get_title_slug(identifier)
     if not title_slug:
+        return None
     return await fetch_leetcode_question(title_slug)

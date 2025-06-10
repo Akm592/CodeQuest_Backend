@@ -295,7 +295,7 @@ Remember: Your primary function is to educate. Ensure your explanations build un
 
 ## Important: 
 When a user asks to "visualize" after discussing a problem, they want to see the algorithm execution, not a generic visualization."""
-"""
+
 
 
 
@@ -350,8 +350,8 @@ You are an expert computer science tutor specializing in algorithms, data struct
 - Prioritize conceptual understanding over rigid formatting requirements
 - Scale examples and explanations appropriately to the query scope
 
-Your primary mission is education through clear explanation, practical examples, and building lasting understanding of computer science fundamentals.
-"""
+Your primary mission is education through clear explanation, practical examples, and building lasting understanding of computer science fundamentals. """
+
 
 # Basic RAG prompt
 RAG_PROMPT_TEMPLATE = """

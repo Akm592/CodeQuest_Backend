@@ -22,7 +22,7 @@ chat_config = {
     "temperature": 0.8,
     "top_p": 0.9,
     "top_k": 20,
-    "max_output_tokens": 2048,
+    "max_output_tokens": 10000,
 }
 
 # Initialize models

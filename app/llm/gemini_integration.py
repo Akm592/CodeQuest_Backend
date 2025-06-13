@@ -22,7 +22,7 @@ chat_config = {
     "temperature": 0.8,
     "top_p": 0.9,
     "top_k": 20,
-    "max_output_tokens": 2048,
+    "max_output_tokens": 10000,
 }
 
 # Initialize models
@@ -112,3 +112,46 @@ async def stream_chat_response(
     except Exception as e:
         logger.error(f"Streaming error: {str(e)}")
         yield "Error generating response."
+        
+    
+    
+async def get_contextual_visualization_data(
+    user_query: str, 
+    chat_history: List[Dict[str, str]] = None,
+    algorithm_context: str = None
+) -> Optional[Dict[str, Any]]:
+    """Generate visualization data with conversation and example context."""
+    try:
+        # Use the enhanced visualization prompt
+        context_prompt = VISUALIZATION_PROMPT
+        
+        if algorithm_context:
+            context_prompt += f"\n\nAlgorithm Solution Context:\n{algorithm_context}\n"
+        
+        if chat_history:
+            # Add recent relevant context
+            recent_context = []
+            for msg in chat_history[-4:]:
+                if any(keyword in msg.get("content", "").lower() 
+                      for keyword in ["algorithm", "solution", "code", "problem", "example"]):
+                    recent_context.append(f"{msg['role']}: {msg['content'][:300]}...")
+            
+            if recent_context:
+                context_prompt += f"\n\nRecent Conversation Context:\n" + "\n".join(recent_context) + "\n"
+
+        chat_session = visualization_model.start_chat()
+        response = await chat_session.send_message_async(context_prompt + "\n\nUser Request: " + user_query)
+        
+        cleaned_text = clean_json_response(response.text)
+        result = json.loads(cleaned_text) if cleaned_text else None
+        
+        if result and isinstance(result, dict):
+            logger.info(f"Generated contextual visualization using example data for: {user_query[:50]}...")
+            return result
+        else:
+            logger.warning(f"Generated invalid visualization data: {cleaned_text[:200]}...")
+            return None
+        
+    except Exception as e:
+        logger.error(f"Contextual visualization error: {str(e)}")
+        return None

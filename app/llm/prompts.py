@@ -169,7 +169,47 @@ ue": 9, "computedValues": {"midValue": 9}, "highlightedIndices": [6],
 
 m
 
-text
+
+
+2. Tree Visualizations (e.g., binary tree):
+{
+  "visualizationType": "tree",
+  "structure": "binary_tree",
+  "nodes": [
+    { "id": "A", "value": "A", "children": ["B", "C"] },
+    { "id": "B", "value": "B", "children": ["D"] },
+    { "id": "C", "value": "C", "children": [] },
+    { "id": "D", "value": "D", "children": [] }
+  ],
+  "layout": "hierarchical"
+}
+
+3. Graph Visualizations (for traversals or algorithms like DFS, BFS, Dijkstra, Prim, Kruskal, etc.):
+{
+  "visualizationType": "graph",
+  "algorithm": "<algorithm_name>",  // e.g., "dfs", "bfs", "dijkstra"
+  "nodes": [
+    { "id": "A", "label": "A" },
+    { "id": "B", "label": "B" },
+    { "id": "C", "label": "C" },
+    // More nodes as needed...
+  ],
+  "edges": [
+    { "source": "A", "target": "B", "weight": 5 },  // weight is optional if not applicable
+    { "source": "A", "target": "C" },
+    // More edges as needed...
+  ],
+  "steps": [
+    {
+      "visitedNodes": ["A", "B"],
+      "currentNode": "B",
+      "message": "Visited A then B"
+    }
+    // Additional steps as needed...
+  ]
+}
+
+
 
 ## Context-Driven Decision Logic
 
@@ -209,6 +249,7 @@ text
 
 Generate the appropriate algorithm execution visualization using the real example data:
 """
+
 
 
 

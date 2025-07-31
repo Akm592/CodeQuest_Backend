@@ -1,0 +1,14 @@
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+exclude = ["app/llm/prompts.py"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "D"]
+ignore = ["D100", "D104", "D105", "D107"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "auto"

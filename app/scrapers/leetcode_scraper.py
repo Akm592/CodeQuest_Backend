@@ -1,10 +1,14 @@
 # app/scrapers/leetcode_scraper.py
-import httpx
+import ast
+import json
 import re
 import unicodedata
+from typing import Any, Dict, List, Optional
+
+import httpx
 from bs4 import BeautifulSoup
-from typing import Optional, List, Dict, Any
-from app.core.logger import logger # Make sure logger is configured in app.core
+
+from app.core.logger import logger  # Make sure logger is configured in app.core
 
 LEETCODE_GRAPHQL_URL = "https://leetcode.com/graphql"
 LEETCODE_ALL_PROBLEMS_URL = "https://leetcode.com/api/problems/all/"
@@ -60,8 +64,7 @@ def normalize_text(text: str) -> str:
     return text
 
 async def get_title_slug(identifier: str) -> Optional[str]:
-    """
-    Resolve a LeetCode question identifier (URL, number, title, combined, or pasted) to a title slug.
+    """Resolve a LeetCode question identifier (URL, number, title, combined, or pasted) to a title slug.
     """
     if not identifier or not isinstance(identifier, str):
         logger.warning("Invalid identifier provided to get_title_slug: must be a non-empty string.")
@@ -227,8 +230,7 @@ async def get_title_slug(identifier: str) -> Optional[str]:
 
 
 async def fetch_leetcode_question(title_slug: str) -> Optional[str]:
-    """
-    Fetch question details from LeetCode GraphQL API using a title slug.
+    """Fetch question details from LeetCode GraphQL API using a title slug.
     Returns a formatted string with details or None on failure.
     """
     logger.info(f"Fetching LeetCode details for title slug: {title_slug}")
@@ -359,33 +361,31 @@ async def fetch_leetcode_question(title_slug: str) -> Optional[str]:
 
 
 async def scrape_leetcode_question(identifier: str) -> Optional[str]:
-    """
-    Scrape a LeetCode question given an identifier (URL, question number, title, combined, or pasted text).
+    """Scrape a LeetCode question given an identifier (URL, question number, title, combined, or pasted text).
     Returns a formatted string with the question details, or None if failed.
     """
     title_slug = await get_title_slug(identifier)
     if not title_slug:
         # get_title_slug already logged the failure reason
         return None
-    
+
     return await fetch_leetcode_question(title_slug)
 
 
 
 def extract_examples_from_content(content: str) -> List[Dict[str, Any]]:
-    """
-    Extract example inputs and outputs from LeetCode problem content.
+    """Extract example inputs and outputs from LeetCode problem content.
     Returns a list of examples with input and output data.
     """
     examples = []
-    
+
     if not content:
         return examples
-    
+
     # Pattern to match Example blocks
     example_pattern = r'Example\s*(\d+):\s*(.*?)(?=Example\s*\d+:|$)'
     example_matches = re.findall(example_pattern, content, re.DOTALL | re.IGNORECASE)
-    
+
     for example_num, example_content in example_matches:
         example_data = {
             "example_number": int(example_num),
@@ -394,73 +394,30 @@ def extract_examples_from_content(content: str) -> List[Dict[str, Any]]:
             "output": None,
             "explanation": None
         }
-        
+
         # Extract Input
         input_match = re.search(r'Input:\s*(.+?)(?=\n(?:Output|Explanation))', example_content, re.DOTALL)
         if input_match:
             input_text = input_match.group(1).strip()
             example_data["input"] = parse_input_data(input_text)
-        
+
         # Extract Output
         output_match = re.search(r'Output:\s*(.+?)(?=\n(?:Explanation|Example|\Z))', example_content, re.DOTALL)
         if output_match:
             output_text = output_match.group(1).strip()
             example_data["output"] = parse_output_data(output_text)
-        
+
         # Extract Explanation
         explanation_match = re.search(r'Explanation:\s*(.+?)(?=\nExample|\Z)', example_content, re.DOTALL)
         if explanation_match:
             example_data["explanation"] = explanation_match.group(1).strip()
-        
+
         examples.append(example_data)
-    
+
     return examples
 
-def parse_input_data(input_text: str) -> Dict[str, Any]:
-    """Parse input text to extract variable names and values."""
-    parsed_input = {
-        "raw": input_text,
-        "variables": {}
-    }
-    
-    # Common patterns for LeetCode inputs
-    patterns = [
-        # nums = [2,7,11,15], target = 9
-        r'(\w+)\s*=\s*\[([^\]]+)\]',
-        # target = 9
-        r'(\w+)\s*=\s*([^\s,]+)',
-        # s = "hello"
-        r'(\w+)\s*=\s*"([^"]*)"',
-        # grid = [["1","1","1"],["0","1","0"]]
-        r'(\w+)\s*=\s*(\[\[.*?\]\])',
-    ]
-    
-    for pattern in patterns:
-        matches = re.findall(pattern, input_text)
-        for var_name, var_value in matches:
-            try:
-                # Try to evaluate as Python literal
-                if var_value.startswith('['):
-                    # Handle arrays
-                    parsed_value = eval(var_value)
-                elif var_value.startswith('"') and var_value.endswith('"'):
-                    # Handle strings
-                    parsed_value = var_value[1:-1]
-                elif var_value.isdigit() or (var_value.startswith('-') and var_value[1:].isdigit()):
-                    # Handle integers
-                    parsed_value = int(var_value)
-                elif '.' in var_value and var_value.replace('.', '').replace('-', '').isdigit():
-                    # Handle floats
-                    parsed_value = float(var_value)
-                else:
-                    parsed_value = var_value
-                
-                parsed_input["variables"][var_name] = parsed_value
-            except:
-                # If parsing fails, store as string
-                parsed_input["variables"][var_name] = var_value
-    
-    return parsed_input
+# def parse_input_data(input_text: str) -> Dict[str, Any]:    # """Parse input text to extract variable names and values."""    # parsed_input = {        # "raw": input_text,        # "variables": {}    # }    # # Pattern to capture variable_name = value    # # It tries to be as broad as possible for the value part    # pattern = r'(\w+)\s*=\s*(.+?)(?:,\s*\w+\s*=|\Z)'    # matches = re.findall(pattern, input_text, re.DOTALL)    # for var_name, var_value_raw in matches:        # var_value = var_value_raw.strip()        # try:            # # Attempt to evaluate the value as a Python literal            # # This handles numbers, booleans, strings, lists, and dictionaries            # parsed_input["variables"][var_name] = ast.literal_eval(var_value)        # except (ValueError, SyntaxError):            # # If literal_eval fails, treat it as a string            # # Remove surrounding quotes if present            # if (var_value.startswith('"') and var_value.endswith('"')) or \               # (var_value.startswith('\'') and var_value.endswith('\'')):                # parsed_input["variables"][var_name] = var_value[1:-1]            # else:                # parsed_input["variables"][var_name] = var_value    # return parsed_input
+
 
 def parse_output_data(output_text: str) -> Dict[str, Any]:
     """Parse output text to extract expected result."""
@@ -468,31 +425,29 @@ def parse_output_data(output_text: str) -> Dict[str, Any]:
         "raw": output_text,
         "value": None
     }
-    
-    # Try to extract the actual output value
-    # Remove common prefixes and clean up
+
     clean_output = re.sub(r'^(Output:\s*)?', '', output_text.strip())
-    
+
     try:
-        # Try to evaluate as Python literal
-        if clean_output.startswith('[') or clean_output.startswith('{'):
-            parsed_output["value"] = eval(clean_output)
-        elif clean_output.startswith('"') and clean_output.endswith('"'):
+        parsed_output["value"] = ast.literal_eval(clean_output)
+    except (ValueError, SyntaxError):
+        # If literal_eval fails, try to handle as a string
+        if (clean_output.startswith('"') and clean_output.endswith('"')) or \
+           (clean_output.startswith('\'') and clean_output.endswith('\'')):
             parsed_output["value"] = clean_output[1:-1]
-        elif clean_output.isdigit() or (clean_output.startswith('-') and clean_output[1:].isdigit()):
-            parsed_output["value"] = int(clean_output)
-        elif clean_output.lower() in ['true', 'false']:
-            parsed_output["value"] = clean_output.lower() == 'true'
+        elif clean_output.lower() == 'true':
+            parsed_output["value"] = True
+        elif clean_output.lower() == 'false':
+            parsed_output["value"] = False
         else:
             parsed_output["value"] = clean_output
-    except:
+    except json.JSONDecodeError: # This exception is not raised by ast.literal_eval
         parsed_output["value"] = clean_output
-    
+
     return parsed_output
 
 async def fetch_leetcode_question(title_slug: str) -> Optional[Dict[str, Any]]:
-    """
-    Enhanced version that returns structured data including examples.
+    """Enhanced version that returns structured data including examples.
     """
     logger.info(f"Fetching LeetCode details for title slug: {title_slug}")
     query = """
@@ -552,7 +507,7 @@ async def fetch_leetcode_question(title_slug: str) -> Optional[Dict[str, Any]]:
         frontend_id = question_data.get('questionFrontendId', '')
         difficulty = question_data.get('difficulty', 'N/A')
         html_content = question_data.get("content", "")
-        
+
         # Clean HTML content
         clean_content = "No description available."
         if html_content:
@@ -577,7 +532,7 @@ async def fetch_leetcode_question(title_slug: str) -> Optional[Dict[str, Any]]:
 
         # Extract examples from content
         examples = extract_examples_from_content(clean_content)
-        
+
         # Add topic tags
         tags = [tag['name'] for tag in question_data.get('topicTags', []) if tag and 'name' in tag]
         tags_str = f"Topics: {', '.join(tags)}\n" if tags else ""
@@ -598,7 +553,7 @@ async def fetch_leetcode_question(title_slug: str) -> Optional[Dict[str, Any]]:
                 f"\nContent:\n{clean_content}"
             )
         }
-        
+
         logger.info(f"Successfully fetched details for: {frontend_id}. {title} with {len(examples)} examples")
         return result
 
@@ -607,8 +562,7 @@ async def fetch_leetcode_question(title_slug: str) -> Optional[Dict[str, Any]]:
         return None
 
 async def scrape_leetcode_question(identifier: str) -> Optional[Dict[str, Any]]:
-    """
-    Enhanced scraper that returns structured data with examples.
+    """Enhanced scraper that returns structured data with examples.
     """
     title_slug = await get_title_slug(identifier)
     if not title_slug:

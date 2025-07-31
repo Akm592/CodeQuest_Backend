@@ -1,18 +1,18 @@
 # app/routers/chat.py
-from fastapi import APIRouter, HTTPException, Depends, Request
-from fastapi.responses import StreamingResponse
-from app.schemas.chat_schemas import ChatRequest # Assuming this is in app/schemas/chat_schemas.py
-from app.llm import gemini_integration
-from app.llm.prompts import GENERAL_PROMPT, CS_TUTOR_PROMPT, VISUALIZATION_PROMPT # Ensure prompts are correctly defined
-from app.memory.chat_memory import ChatMemory, ChatSession # Import ChatSession for type hint
-from app.database.supabase_client import SupabaseManager # Assuming this is configured
-# Remove RAG import if not actively used in this specific flow for now
-# from app.rag import rag_engine
-from typing import Dict, Any, List, AsyncGenerator, Optional
-import uuid
 import json
 import re
-from app.core.logger import logger # Ensure logger is configured
+import uuid
+from typing import AsyncGenerator, Dict, List, Optional, Any
+
+from fastapi import APIRouter, HTTPException, Request
+from fastapi.responses import StreamingResponse
+
+from app.core.logger import logger
+from app.database.supabase_client import SupabaseManager
+from app.llm import gemini_integration
+from app.llm.prompts import CS_TUTOR_PROMPT, GENERAL_PROMPT, VISUALIZATION_PROMPT
+from app.memory.chat_memory import ChatMemory, ChatSession
+from app.schemas.chat_schemas import ChatRequest
 from app.scrapers.leetcode_scraper import scrape_leetcode_question
 
 router = APIRouter()
@@ -64,11 +64,10 @@ def classify_intent(query: str) -> str:
 async def stream_response(
     user_input: str,
     session_id: str,
-    chat_session: ChatSession, # Use ChatSession type hint from chat_memory
-    chat_history: List[Dict[str, str]]
+    chat_session: ChatSession,
+    chat_history: List[Dict[str, str]],
 ) -> AsyncGenerator[str, None]:
-    """
-    Generate streaming response as SSE events, handling LeetCode scraping,
+    """Generate streaming response as SSE events, handling LeetCode scraping,
     solution generation, visualization requests, and regular chat flow.
     Yields JSON strings formatted for Server-Sent Events.
     """
@@ -126,8 +125,8 @@ async def stream_response(
             # Append visualization request to prompt if needed
             if request_visualization:
                  prompt_for_llm += (
-                     f"\n\n**Additionally:** Based on the optimal algorithm discussed, generate the necessary JSON data to visualize its key steps or the primary data structure involved (e.g., array states, DP table build-up, tree/graph traversal). "
-                     f"Output this JSON *after* the textual explanation, enclosed in ```json ... ``` blocks. Use one of the standard visualization types (sorting, tree, graph, array, matrix, table, etc.) as defined previously."
+                     "\n\n**Additionally:** Based on the optimal algorithm discussed, generate the necessary JSON data to visualize its key steps or the primary data structure involved (e.g., array states, DP table build-up, tree/graph traversal). "
+                     "Output this JSON *after* the textual explanation, enclosed in ```json ... ``` blocks. Use one of the standard visualization types (sorting, tree, graph, array, matrix, table, etc.) as defined previously."
                  )
                  logger.info(f"[Session: {session_id}] Visualization request added to LLM prompt.")
 
@@ -146,42 +145,51 @@ async def stream_response(
 
             # --- Post-Streaming Processing for Visualization ---
             if request_visualization:
-                logger.info(f"[Session: {session_id}] Attempting to extract visualization JSON from LLM output.")
-                # Regex to find ```json ... ``` block or a standalone JSON object/array
-                # More robust regex to handle potential surrounding text and markdown variations
-                json_match = re.search(r"```json\s*([\s\S]*?)\s*```|(?<!`)(\{\s*\"visualizationType\".*?\})(?!`)|(?<!`)(\[\s*\{.*?\}\s*\])(?!`)", full_llm_output, re.DOTALL | re.IGNORECASE)
+                logger.info(
+                    f"[Session: {session_id}] Attempting to extract visualization JSON from LLM output."
+                )
+                json_match = re.search(
+                    r"```json\s*([\s\S]*?)\s*```|(?<!`)(\{\s*\"visualizationType\".*?\})(?!`)|(?<!`)(\[\s*\{.*?\}\s*\])(?!`)",
+                    full_llm_output,
+                    re.DOTALL | re.IGNORECASE,
+                )
 
                 if json_match:
-                    # Extract the JSON string from the first non-None group
                     json_str = next((g for g in json_match.groups() if g is not None), None)
 
                     if json_str:
                         try:
-                            # Attempt to parse the extracted JSON string
                             visualization_json = json.loads(json_str.strip())
-                            # Basic validation: check if it's a dict and has visualizationType
                             if isinstance(visualization_json, dict) and "visualizationType" in visualization_json:
-                                # Remove the JSON block from the text response to avoid duplication
-                                bot_response_text_part = full_llm_output.replace(json_match.group(0), "").strip()
-                                logger.info(f"[Session: {session_id}] Successfully extracted and parsed visualization JSON.")
-                                # Send the visualization data as a separate SSE event
+                                bot_response_text_part = full_llm_output.replace(
+                                    json_match.group(0), ""
+                                ).strip()
+                                logger.info(
+                                    f"[Session: {session_id}] Successfully extracted and parsed visualization JSON."
+                                )
                                 yield f"data: {json.dumps({'type': 'visualization', 'data': visualization_json})}\n\n"
                             else:
-                                logger.warning(f"[Session: {session_id}] Extracted JSON is invalid or missing 'visualizationType'. JSON: {json_str[:200]}...")
-                                bot_response_text_part = full_llm_output # Keep full output if JSON is invalid
-                                visualization_json = None # Reset vis_data
+                                logger.warning(
+                                    f"[Session: {session_id}] Extracted JSON is invalid or missing "
+                                    f"'visualizationType'. JSON: {json_str[:200]}..."
+                                )
+                                bot_response_text_part = full_llm_output
+                                visualization_json = None
                         except json.JSONDecodeError as e:
-                            logger.warning(f"[Session: {session_id}] Failed to parse extracted JSON: {e}. JSON string: {json_str[:200]}...")
-                            bot_response_text_part = full_llm_output # Keep full output if JSON parsing failed
+                            logger.warning(
+                                f"[Session: {session_id}] Failed to parse extracted JSON: {e}. "
+                                f"JSON string: {json_str[:200]}..."
+                            )
+                            bot_response_text_part = full_llm_output
                             visualization_json = None
                     else:
-                         logger.info("[Session: {session_id}] Regex matched, but no JSON content found in groups.")
-                         bot_response_text_part = full_llm_output
+                        logger.info("[Session: {session_id}] Regex matched, but no JSON content found in groups.")
+                        bot_response_text_part = full_llm_output
                 else:
-                     logger.info(f"[Session: {session_id}] No visualization JSON block found in the LLM output.")
-                     bot_response_text_part = full_llm_output # No JSON found, use full output
+                    logger.info(f"[Session: {session_id}] No visualization JSON block found in the LLM output.")
+                    bot_response_text_part = full_llm_output
             else:
-                 bot_response_text_part = full_llm_output # No visualization requested
+                bot_response_text_part = full_llm_output
 
             # --- Clean up state and store results ---
             chat_session.set_state("awaiting_language", False)
@@ -323,8 +331,7 @@ async def stream_response(
 
 @router.post("/scrape_leetcode")
 async def scrape_leetcode_endpoint(request: Request):
-    """
-    Endpoint to test scraping a LeetCode question given an identifier.
+    """Endpoint to test scraping a LeetCode question given an identifier.
     Uses the enhanced scraper logic.
     """
     try:
@@ -355,8 +362,7 @@ async def scrape_leetcode_endpoint(request: Request):
 
 @router.post("/chat")
 async def chat_endpoint(chat_request: ChatRequest, request: Request):
-    """
-    Main chat endpoint. Handles user input, manages session state,
+    """Main chat endpoint. Handles user input, manages session state,
     stores messages, and returns a streaming response.
     """
     user_input = chat_request.user_input.strip()
@@ -378,7 +384,7 @@ async def chat_endpoint(chat_request: ChatRequest, request: Request):
     # --- Get/Create Chat Session & History ---
     chat_session = chat_memory.get_session(session_id)
     # Get a reasonable amount of history for context, limit token usage later if needed
-    chat_history = chat_session.get_history(context_window_size=10) # Get last 10 turns (user+bot)
+    chat_history = chat_session.get_history() # Get last 10 turns (user+bot)
 
     # --- Store User Message ---
     # Add to in-memory history first
@@ -427,7 +433,8 @@ async def chat_endpoint(chat_request: ChatRequest, request: Request):
 
 
 # --- Session Management Endpoints (Keep as provided originally, ensure imports) ---
-from typing import List # Add List import if not already present
+from typing import List  # Add List import if not already present
+
 
 @router.post("/sessions", response_model=dict)
 async def create_chat_session_endpoint(request: Request):

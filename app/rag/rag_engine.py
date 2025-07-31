@@ -1,5 +1,6 @@
 # RAG logic with conversation context support
-from typing import Optional, List, Dict
+from typing import Dict, List, Optional
+
 from app.llm.prompts import RAG_PROMPT_TEMPLATE, RAG_WITH_HISTORY_TEMPLATE
 
 # In a real RAG system, you would load and index documents here.
@@ -13,8 +14,7 @@ KNOWLEDGE_BASE = {
 
 
 async def retrieve_relevant_context(query: str) -> Optional[str]:
-    """
-    Basic context retrieval - in a real RAG, this would involve vector search.
+    """Basic context retrieval - in a real RAG, this would involve vector search.
     For now, we'll do a simple keyword-based lookup.
     """
     query_lower = query.lower()
@@ -28,13 +28,13 @@ async def retrieve_relevant_context(query: str) -> Optional[str]:
 async def generate_rag_response(
     user_query: str, context: str, chat_history: List[Dict[str, str]] = None
 ) -> str:
-    """
-    Generates a response using RAG prompt, retrieved context, and conversation history.
+    """Generates a response using RAG prompt, retrieved context, and conversation history.
 
     Args:
         user_query: The current user query
         context: Retrieved context information
         chat_history: List of previous messages in format [{"role": "user", "content": "..."}, {"role": "bot", "content": "..."}]
+
     """
     from app.llm.gemini_integration import get_chat_response  # Avoid circular import
 

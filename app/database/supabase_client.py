@@ -1,9 +1,11 @@
 # app/database/supabase_client.py
-from typing import Optional, List, Dict # Ensure Dict is imported
-from supabase import create_client, Client
+import uuid  # Import uuid if needed for validation within the class
+from typing import Dict, List, Optional  # Ensure Dict is imported
+
+from supabase import Client, create_client
+
 from app.core.config import settings
 from app.core.logger import logger
-import uuid # Import uuid if needed for validation within the class
 
 
 class SupabaseManager:
@@ -152,12 +154,11 @@ class SupabaseManager:
         content: str,
         intent: Optional[str] = None,
         visualization_data: Optional[Dict] = None,
-        parent_message_id: Optional[str] = None, # Ensure this column exists in your DB table
+        parent_message_id: Optional[str] = None,
         metadata: Optional[Dict] = None,
     ) -> bool:
         """Store a message in the database."""
         try:
-             # Validate UUID format before inserting
             session_uuid = uuid.UUID(session_id)
             client = cls.get_client()
             message_data = {
@@ -165,13 +166,14 @@ class SupabaseManager:
                 "sender_type": sender_type,
                 "content": content,
                 "intent": intent,
-                # Ensure JSON serializable data is passed for JSONB columns
                 "visualization_data": visualization_data if visualization_data else None,
-                "parent_message_id": str(uuid.UUID(parent_message_id)) if parent_message_id else None, # Validate parent ID if provided
+                "parent_message_id": (
+                    str(uuid.UUID(parent_message_id)) if parent_message_id else None
+                ),
                 "metadata": metadata or {},
             }
 
-            response = client.table("messages").insert(message_data).execute()
+            client.table("messages").insert(message_data).execute()
             # Optional: Check for errors in response
             # if response.error: logger.error(...) return False
             logger.debug(f"Stored message for session {session_id} by {sender_type}")

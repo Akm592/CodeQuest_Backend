@@ -6,7 +6,7 @@ import google.generativeai as genai
 
 from app.core.config import settings
 from app.core.logger import logger
-from app.llm.prompts import VISUALIZATION_PROMPT
+from app.llm.prompts import VISUALIZATION_PROMPT , INTENT_CLASSIFICATION_PROMPT
 
 genai.configure(api_key=settings.GEMINI_API_KEY)
 
@@ -162,3 +162,52 @@ async def get_contextual_visualization_data(
     except Exception as e:
         logger.error(f"Contextual visualization error: {str(e)}")
         return None
+
+
+# INTENT_CLASSIFICATION_PROMPT = """
+# You are an expert intent classifier for a computer science tutoring chatbot. Your task is to analyze the user's query and classify it into one of the following categories:
+
+# - "visualization": The user wants to see a step-by-step execution of an algorithm, often with specific data. They use words like "visualize", "show steps", "trace", "draw", "animate", or provide an algorithm name along with data like an array or graph.
+# - "cs_tutor": The user wants an explanation of a concept, an algorithm, or a solution to a problem (like a LeetCode question). They use words like "teach me", "explain", "how does...work", "what is", "solve", or ask for complexity analysis.
+# - "general": The query is a general conversation starter, a greeting, or a question not related to a specific CS concept or visualization.
+
+# Analyze the following user query and return ONLY the single-word classification. Do not add any other text, reasoning, or markdown.
+
+# Examples:
+# - Query: "Bubble sort visualization with array [64, 34, 25, 12, 22, 11, 90]" -> visualization
+# - Query: "teach me binary search" -> cs_tutor
+# - Query: "solve leetcode 1. two sum" -> cs_tutor
+# - Query: "Quick sort with pivot selection on [3, 6, 8, 10, 1, 2, 1]" -> visualization
+# - Query: "what is the time complexity of merge sort?" -> cs_tutor
+# - Query: "hi how are you" -> general
+# - Query: "BFS traversal starting from node A in graph with edges [(A,B), (A,C), (B,D), (C,D)]" -> visualization
+
+# User Query: "{user_query}"
+# """
+
+async def classify_intent_with_llm(user_query: str) -> str:
+    """Uses the LLM to classify the user's intent."""
+    try:
+        # Use the standard chat model for this quick task. It's configured for fast responses.
+        prompt = INTENT_CLASSIFICATION_PROMPT.format(user_query=user_query)
+
+        # We need a quick, non-streaming response for classification.
+        response = await chat_model.generate_content_async(prompt)
+
+        # The response should be a single, clean word.
+        # .strip() handles leading/trailing whitespace. .lower() ensures consistency.
+        intent = response.text.strip().lower()
+
+        # Validate the response from the LLM to ensure it's one of our expected categories.
+        if intent in ["visualization", "cs_tutor", "general"]:
+            logger.info(f"LLM classified intent for '{user_query[:60]}...' as: {intent}")
+            return intent
+        else:
+            # If the LLM returns something unexpected (e.g., an explanation), log it and default.
+            logger.warning(f"LLM returned an invalid intent classification: '{intent}'. Defaulting to 'general'.")
+            return "general"
+
+    except Exception as e:
+        logger.error(f"Error during LLM intent classification: {e}. Defaulting to 'general'.")
+        # In case of an API error, we default to the safest, most general category.
+        return "general"

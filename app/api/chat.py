@@ -18,49 +18,6 @@ from app.scrapers.leetcode_scraper import scrape_leetcode_question
 router = APIRouter()
 chat_memory = ChatMemory()
 
-# Enhanced intent classification
-def classify_intent(query: str) -> str:
-    """Determine the initial intent of the user query."""
-    if not query or not isinstance(query, str):
-        return "general" # Default for empty or invalid input
-
-    query_lower = query.lower().strip()
-
-    # Keywords suggesting visualization request
-    vis_keywords = {"visualize", "show steps", "draw", "diagram", "animate"}
-    # Keywords suggesting CS tutoring or LeetCode context
-    cs_keywords = {
-        "computer science", "data structure", "algorithm", "explain", "how does", "implement",
-        "example code", "time complexity", "space complexity", "big o", "leetcode", "problem",
-        "solution", "code for", "solve"
-    }
-    # Patterns for LeetCode identifiers
-    leetcode_url_pattern = r"leetcode\.com/problems/"
-    leetcode_num_dot_pattern = r"^\s*\d+\s*\." # e.g., "368." or " 368. "
-    leetcode_just_num_pattern = r"^\s*\d+\s*$" # e.g., "368"
-
-    # Prioritize visualization if explicitly asked
-    if any(kw in query_lower for kw in vis_keywords):
-        logger.debug(f"Intent classified as 'visualization' based on keywords: {query[:80]}...")
-        return "visualization"
-
-    # Check for LeetCode patterns or CS keywords
-    if (re.search(leetcode_url_pattern, query_lower) or
-        re.match(leetcode_num_dot_pattern, query_lower) or
-        re.match(leetcode_just_num_pattern, query_lower) or
-        any(kw in query_lower for kw in cs_keywords)):
-        logger.debug(f"Intent classified as 'cs_tutor' based on keywords/patterns: {query[:80]}...")
-        return "cs_tutor"
-
-    # Removed RAG keywords for now to simplify focus
-    # rag_keywords = {"what is", "define", "information about"}
-    # elif any(kw in query_lower for kw in rag_keywords):
-    #     return "rag"
-
-    logger.debug(f"Intent classified as 'general': {query[:80]}...")
-    return "general"
-
-
 async def stream_response(
     user_input: str,
     session_id: str,
@@ -210,7 +167,7 @@ async def stream_response(
 
         # --- Regular Chat Logic / Initial LeetCode Detection ---
         else:
-            initial_intent = classify_intent(user_input)
+            initial_intent = await gemini_integration.classify_intent_with_llm(user_input)
             # Check if the user explicitly asked for visualization in *this* turn
             request_visualization_this_turn = (initial_intent == "visualization")
 
@@ -390,7 +347,7 @@ async def chat_endpoint(chat_request: ChatRequest, request: Request):
     # Add to in-memory history first
     chat_session.add_message("user", user_input)
     # Log initial intent guess for the user message to DB
-    initial_intent_for_logging = classify_intent(user_input)
+    initial_intent_for_logging = await gemini_integration.classify_intent_with_llm(user_input)
     await SupabaseManager.store_message(
         session_id=session_id,
         sender_type="user",

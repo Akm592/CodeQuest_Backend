@@ -29,7 +29,9 @@ class SupabaseManager:
     async def create_chat_session(
         cls, user_id: str, session_id: str, session_name: str = "New Chat"
     ) -> bool:
-        """Create a new chat session in the database."""
+        """Create a new chat session in the database.
+        Note: This is only called for authenticated users. Guest sessions are ephemeral.
+        """
         try:
             client = cls.get_client()
             # Ensure session_id is string
@@ -37,13 +39,13 @@ class SupabaseManager:
             # Basic validation
             uuid.UUID(session_id_str)
 
-            response = client.table("chat_sessions").insert(
-                {
-                    "session_id": session_id_str,
-                    "user_id": user_id,
-                    "session_name": session_name,
-                }
-            ).execute()
+            insert_data = {
+                "id": session_id_str,
+                "session_name": session_name,
+                "user_id": user_id,
+            }
+
+            response = client.table("chat_sessions").insert(insert_data).execute()
             # Optional: Check response status or errors if execute() provides them
             # if response.error: logger.error(...) return False
             logger.info(f"Successfully inserted chat session {session_id_str}")
@@ -66,7 +68,7 @@ class SupabaseManager:
             response = (
                 client.table("chat_sessions")
                 .select("*")
-                .eq("session_id", str(session_uuid)) # Query using the validated string UUID
+                .eq("id", str(session_uuid)) # Query using the validated string UUID
                 .limit(1) # Optimization: We only expect one session
                 .execute()
             )
@@ -134,7 +136,7 @@ class SupabaseManager:
             client = cls.get_client()
             response = client.table("chat_sessions").update(
                 {"session_name": session_name}
-            ).eq("session_id", str(session_uuid)).execute()
+            ).eq("id", str(session_uuid)).execute()
             # Optional: Check if update actually affected rows if API provides count
             # For now, assume success if no exception
             logger.info(f"Updated session name for {session_id} to '{session_name}'")
@@ -186,3 +188,5 @@ class SupabaseManager:
             logger.error(f"Exception storing message for session {session_id}: {str(e)}", exc_info=True)
             # logger.debug(f"Message data attempted: {message_data}") # Uncomment for deep debugging
             return False
+
+# Note: migrate_chat_sessions method removed - guest sessions are ephemeral and don't need migration

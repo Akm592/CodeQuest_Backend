@@ -14,15 +14,48 @@ from app.llm.prompts import CS_TUTOR_PROMPT, GENERAL_PROMPT, VISUALIZATION_PROMP
 from app.memory.chat_memory import ChatMemory, ChatSession
 from app.schemas.chat_schemas import ChatRequest
 from app.scrapers.leetcode_scraper import scrape_leetcode_question
+from app.core.config import settings
+import time
+from collections import defaultdict
 
 router = APIRouter()
 chat_memory = ChatMemory()
+
+# Rate limiting state
+in_memory_rate_limit = defaultdict(list)
+
+def check_rate_limit(ip: str):
+    """Checks if the IP has exceeded the daily rate limit."""
+    now = time.time()
+    # Prune old timestamps (24 hours window)
+    in_memory_rate_limit[ip] = [t for t in in_memory_rate_limit[ip] if now - t < 86400]
+    
+    # Parse rules
+    try:
+        rules = json.loads(settings.RATE_LIMIT_RULES)
+    except Exception:
+        rules = {}
+        # logger.error("Failed to parse RATE_LIMIT_RULES") # Optional log
+    
+    limit = 10 # Default limit
+    
+    if ip in rules:
+        limit = int(rules[ip])
+        
+    if limit < 0: # Unlimited
+        return
+
+    if len(in_memory_rate_limit[ip]) >= limit:
+        raise HTTPException(status_code=429, detail="Daily rate limit exceeded for guest usage. Please create an account for unlimited access.")
+    
+    in_memory_rate_limit[ip].append(now)
 
 async def stream_response(
     user_input: str,
     session_id: str,
     chat_session: ChatSession,
     chat_history: List[Dict[str, str]],
+    persist: bool = True,
 ) -> AsyncGenerator[str, None]:
     """Generate streaming response as SSE events, handling LeetCode scraping,
     solution generation, visualization requests, and regular chat flow.
@@ -44,9 +77,10 @@ async def stream_response(
                 yield f"data: {json.dumps({'type': 'text', 'content': response})}\n\n"
                 # Keep awaiting language state, don't clear it
                 chat_session.add_message("bot", response) # Log bot asking again
-                await SupabaseManager.store_message(
-                    session_id=session_id, sender_type="bot", content=response, intent="cs_tutor", metadata={"response_type": "clarification_retry"}
-                )
+                if persist:
+                    await SupabaseManager.store_message(
+                        session_id=session_id, sender_type="bot", content=response, intent="cs_tutor", metadata={"response_type": "clarification_retry"}
+                    )
                 return # Stop processing this turn
 
             if not scraped_question:
@@ -58,9 +92,10 @@ async def stream_response(
                 chat_session.set_state("scraped_question", None)
                 chat_session.set_state("request_visualization", False)
                 chat_session.add_message("bot", response)
-                await SupabaseManager.store_message(
-                    session_id=session_id, sender_type="bot", content=response, intent="error", metadata={"response_type": "state_error"}
-                )
+                if persist:
+                    await SupabaseManager.store_message(
+                        session_id=session_id, sender_type="bot", content=response, intent="error", metadata={"response_type": "state_error"}
+                    )
                 return # Stop processing
 
             # --- Generate LeetCode Solution ---
@@ -155,14 +190,15 @@ async def stream_response(
 
             # Store the final response (text part)
             chat_session.add_message("bot", bot_response_text_part)
-            await SupabaseManager.store_message(
-                session_id=session_id,
-                sender_type="bot",
-                content=bot_response_text_part,
-                intent="cs_tutor", # Mark intent as cs_tutor
-                visualization_data=visualization_json, # Store extracted JSON if any
-                metadata={"response_type": "LLM_solution", "language": language, "visualization_provided": bool(visualization_json)}
-            )
+            if persist:
+                await SupabaseManager.store_message(
+                    session_id=session_id,
+                    sender_type="bot",
+                    content=bot_response_text_part,
+                    intent="cs_tutor", # Mark intent as cs_tutor
+                    visualization_data=visualization_json, # Store extracted JSON if any
+                    metadata={"response_type": "LLM_solution", "language": language, "visualization_provided": bool(visualization_json)}
+                )
             logger.info(f"[Session: {session_id}] Finished streaming LeetCode solution.")
 
         # --- Regular Chat Logic / Initial LeetCode Detection ---
@@ -194,14 +230,15 @@ async def stream_response(
                 response = "I found the LeetCode question details. Which programming language would you like the solution in (e.g., Python, Java, C++)?"
                 yield f"data: {json.dumps({'type': 'text', 'content': response})}\n\n"
                 chat_session.add_message("bot", response) # Add bot's question to history
-                await SupabaseManager.store_message(
-                    session_id=session_id,
-                    sender_type="bot",
-                    content=response,
-                    intent="cs_tutor", # Intent is now confirmed cs_tutor
-                    visualization_data=None,
-                    metadata={"response_type": "clarification_language", "needs_language": True}
-                )
+                if persist:
+                    await SupabaseManager.store_message(
+                        session_id=session_id,
+                        sender_type="bot",
+                        content=response,
+                        intent="cs_tutor", # Intent is now confirmed cs_tutor
+                        visualization_data=None,
+                        metadata={"response_type": "clarification_language", "needs_language": True}
+                    )
 
             # --- No LeetCode Found or Scrape Failed: Handle as Normal Intent ---
             else:
@@ -259,14 +296,15 @@ async def stream_response(
                 # --- Store Final Bot Response (Non-LeetCode Flow) ---
                 if bot_response_text: # Avoid storing empty messages
                     chat_session.add_message("bot", bot_response_text)
-                    await SupabaseManager.store_message(
-                        session_id=session_id,
-                        sender_type="bot",
-                        content=bot_response_text,
-                        intent=initial_intent,
-                        visualization_data=vis_data, # Store vis_data if generated
-                        metadata={"response_type": "LLM_general"} # More specific metadata
-                    )
+                    if persist:
+                        await SupabaseManager.store_message(
+                            session_id=session_id,
+                            sender_type="bot",
+                            content=bot_response_text,
+                            intent=initial_intent,
+                            visualization_data=vis_data, # Store vis_data if generated
+                            metadata={"response_type": "LLM_general"} # More specific metadata
+                        )
         logger.info(f"[Session: {session_id}] Finished processing stream.")
 
     except Exception as e:
@@ -276,10 +314,11 @@ async def stream_response(
             yield f"data: {json.dumps({'type': 'error', 'content': error_message})}\n\n"
             # Also store the error message
             chat_session.add_message("bot", f"Error: {error_message}")
-            await SupabaseManager.store_message(
-                        session_id=session_id, sender_type="bot", content=f"Internal Error: {e}",
-                        intent="error", metadata={"response_type": "exception"}
-                    )
+            if persist:
+                await SupabaseManager.store_message(
+                    session_id=session_id, sender_type="bot", content=f"Internal Error: {e}",
+                    intent="error", metadata={"response_type": "exception"}
+                )
         except Exception as yield_err:
             logger.error(f"[Session: {session_id}] Failed to yield error message to client: {yield_err}")
 
@@ -340,46 +379,61 @@ async def chat_endpoint(chat_request: ChatRequest, request: Request):
 
     # --- Get/Create Chat Session & History ---
     chat_session = chat_memory.get_session(session_id)
+    
+    # --- Determine if Guest (ephemeral) or Authenticated (persistent) ---
+    auth_header = request.headers.get("Authorization")
+    is_guest = not auth_header
+    persist = not is_guest  # Guests don't persist to DB
+    
+    # --- Rate Limit Check for Guest Sessions ---
+    if is_guest:
+        client_ip = request.client.host if request.client else "unknown"
+        check_rate_limit(client_ip)
+        logger.info(f"[Session: {session_id}] Guest request from IP: {client_ip}")
+    
     # Get a reasonable amount of history for context, limit token usage later if needed
     chat_history = chat_session.get_history() # Get last 10 turns (user+bot)
 
     # --- Store User Message ---
-    # Add to in-memory history first
+    # Add to in-memory history first (always)
     chat_session.add_message("user", user_input)
-    # Log initial intent guess for the user message to DB
-    initial_intent_for_logging = await gemini_integration.classify_intent_with_llm(user_input)
-    await SupabaseManager.store_message(
-        session_id=session_id,
-        sender_type="user",
-        content=user_input,
-        intent=initial_intent_for_logging, # Store initial guess based on input
-        visualization_data=None,
-        metadata={"from_frontend": True}
-    )
+    
+    # Only interact with DB for authenticated users
+    if persist:
+        # Log initial intent guess for the user message to DB
+        initial_intent_for_logging = await gemini_integration.classify_intent_with_llm(user_input)
+        await SupabaseManager.store_message(
+            session_id=session_id,
+            sender_type="user",
+            content=user_input,
+            intent=initial_intent_for_logging, # Store initial guess based on input
+            visualization_data=None,
+            metadata={"from_frontend": True}
+        )
 
-    # --- Session Naming Logic (on first *user* message after session creation) ---
-    # Check if session exists in DB *and* if it still has the default name "New Chat"
-    # This is less reliable than checking message count, let's check messages
-    messages_in_session = await SupabaseManager.get_messages_by_session_id(session_id)
-    # Check if messages exist and count user messages. If only 1 user message (this one), set name.
-    if messages_in_session is not None:
-        user_message_count = sum(1 for msg in messages_in_session if msg.get('sender_type') == 'user')
-        if user_message_count == 1:
-             # Use first few words of the *first* user message
-             session_name = " ".join(user_input.split()[:5]) # Use up to 5 words
-             if not session_name: session_name = "Chat" # Fallback if input was whitespace
-             logger.info(f"Setting session name for {session_id} to '{session_name}' based on first user message.")
-             # Ensure session actually exists before updating name
-             session_exists = await SupabaseManager.get_session_by_id(session_id) # Need this helper
-             if session_exists:
-                await SupabaseManager.update_chat_session_name(session_id, session_name)
-             else:
-                logger.warning(f"Attempted to set name for non-existent session {session_id} in DB.")
+        # --- Session Naming Logic (on first *user* message after session creation) ---
+        # Check if session exists in DB *and* if it still has the default name "New Chat"
+        # This is less reliable than checking message count, let's check messages
+        messages_in_session = await SupabaseManager.get_messages_by_session_id(session_id)
+        # Check if messages exist and count user messages. If only 1 user message (this one), set name.
+        if messages_in_session is not None:
+            user_message_count = sum(1 for msg in messages_in_session if msg.get('sender_type') == 'user')
+            if user_message_count == 1:
+                 # Use first few words of the *first* user message
+                 session_name = " ".join(user_input.split()[:5]) # Use up to 5 words
+                 if not session_name: session_name = "Chat" # Fallback if input was whitespace
+                 logger.info(f"Setting session name for {session_id} to '{session_name}' based on first user message.")
+                 # Ensure session actually exists before updating name
+                 session_exists = await SupabaseManager.get_session_by_id(session_id) # Need this helper
+                 if session_exists:
+                    await SupabaseManager.update_chat_session_name(session_id, session_name)
+                 else:
+                    logger.warning(f"Attempted to set name for non-existent session {session_id} in DB.")
 
 
     # --- Return Streaming Response ---
     return StreamingResponse(
-        stream_response(user_input, session_id, chat_session, chat_history),
+        stream_response(user_input, session_id, chat_session, chat_history, persist=persist),
         media_type="text/event-stream",
         headers={
             'Cache-Control': 'no-cache',
@@ -395,22 +449,35 @@ from typing import List  # Add List import if not already present
 
 @router.post("/sessions", response_model=dict)
 async def create_chat_session_endpoint(request: Request):
-    """Creates a new chat session entry in the database."""
-    # TODO: Replace placeholder with actual user authentication/identification
-    user_id = "user_placeholder" # Replace with actual user ID from auth
+    """Creates a new chat session. 
+    For authenticated users: Creates entry in database.
+    For guests: Returns a UUID immediately (ephemeral, no DB storage).
+    """
+    auth_header = request.headers.get("Authorization")
     new_session_id = str(uuid.uuid4())
-    # Create session with default name
-    success = await SupabaseManager.create_chat_session(user_id, new_session_id, session_name="New Chat")
-    if not success:
-        logger.error(f"Failed to create new chat session for user {user_id}")
-        raise HTTPException(status_code=500, detail="Failed to create new chat session in database")
-    logger.info(f"Created new chat session {new_session_id} for user {user_id}")
+    
+    if auth_header:
+        # Authenticated user: persist to DB
+        user_id = "user_placeholder"  # TODO: Extract from auth token
+        success = await SupabaseManager.create_chat_session(user_id, new_session_id, session_name="New Chat")
+        if not success:
+            logger.error(f"Failed to create new chat session for user {user_id}")
+            raise HTTPException(status_code=500, detail="Failed to create new chat session in database")
+        logger.info(f"Created new chat session {new_session_id} for authenticated user {user_id}")
+    else:
+        # Guest user: ephemeral session, no DB call needed
+        logger.info(f"Created ephemeral session {new_session_id} for guest user")
+    
     return {"session_id": new_session_id}
 
 @router.get("/sessions", response_model=List[dict])
 async def get_chat_sessions_endpoint(request: Request):
     """Retrieves all chat sessions for the current user."""
-    # TODO: Replace placeholder with actual user authentication/identification
+    auth_header = request.headers.get("Authorization")
+    if not auth_header:
+        # Guests cannot list sessions (security risk to see other guests' sessions)
+        return []
+        
     user_id = "user_placeholder" # Replace with actual user ID from auth
     sessions = await SupabaseManager.get_chat_sessions_for_user(user_id)
     if sessions is None:
@@ -421,8 +488,15 @@ async def get_chat_sessions_endpoint(request: Request):
 
 @router.get("/sessions/{session_id}/messages", response_model=List[dict])
 async def get_session_messages_endpoint(session_id: str, request: Request):
-    """Retrieves all messages for a given chat session."""
-    # TODO: Add authorization check: Does the current user own this session_id?
+    """Retrieves all messages for a given chat session.
+    For guests: Returns empty list (messages are not persisted).
+    For authenticated: Fetches from database.
+    """
+    auth_header = request.headers.get("Authorization")
+    if not auth_header:
+        # Guest sessions are ephemeral - no messages in DB
+        return []
+    
     try:
         # Validate session_id format
         uuid.UUID(session_id)
@@ -436,6 +510,4 @@ async def get_session_messages_endpoint(session_id: str, request: Request):
     # It's okay to return an empty list if the session exists but has no messages yet
     return messages
 
-# REMINDER: Ensure you have added the `get_session_by_id` async method
-#           to the `SupabaseManager` class in `app/database/supabase_client.py`
-#           as shown in the previous response.
+# Note: migrate_sessions_endpoint removed - guest sessions are ephemeral and don't need migration

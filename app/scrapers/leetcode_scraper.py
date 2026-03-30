@@ -416,7 +416,32 @@ def extract_examples_from_content(content: str) -> List[Dict[str, Any]]:
 
     return examples
 
-# def parse_input_data(input_text: str) -> Dict[str, Any]:    # """Parse input text to extract variable names and values."""    # parsed_input = {        # "raw": input_text,        # "variables": {}    # }    # # Pattern to capture variable_name = value    # # It tries to be as broad as possible for the value part    # pattern = r'(\w+)\s*=\s*(.+?)(?:,\s*\w+\s*=|\Z)'    # matches = re.findall(pattern, input_text, re.DOTALL)    # for var_name, var_value_raw in matches:        # var_value = var_value_raw.strip()        # try:            # # Attempt to evaluate the value as a Python literal            # # This handles numbers, booleans, strings, lists, and dictionaries            # parsed_input["variables"][var_name] = ast.literal_eval(var_value)        # except (ValueError, SyntaxError):            # # If literal_eval fails, treat it as a string            # # Remove surrounding quotes if present            # if (var_value.startswith('"') and var_value.endswith('"')) or \               # (var_value.startswith('\'') and var_value.endswith('\'')):                # parsed_input["variables"][var_name] = var_value[1:-1]            # else:                # parsed_input["variables"][var_name] = var_value    # return parsed_input
+def parse_input_data(input_text: str) -> Dict[str, Any]:
+    """Parse input text to extract variable names and values."""
+    parsed_input = {
+        "raw": input_text,
+        "variables": {}
+    }
+    # Pattern to capture variable_name = value
+    # It tries to be as broad as possible for the value part
+    pattern = r'(\w+)\s*=\s*(.+?)(?:,\s*\w+\s*=|\Z)'
+    matches = re.findall(pattern, input_text, re.DOTALL)
+    for var_name, var_value_raw in matches:
+        var_value = var_value_raw.strip()
+        try:
+            # Attempt to evaluate the value as a Python literal
+            # This handles numbers, booleans, strings, lists, and dictionaries
+            parsed_input["variables"][var_name] = ast.literal_eval(var_value)
+        except (ValueError, SyntaxError):
+            # If literal_eval fails, treat it as a string
+            # Remove surrounding quotes if present
+            if (var_value.startswith('"') and var_value.endswith('"')) or \
+               (var_value.startswith('\'') and var_value.endswith('\'')):
+                parsed_input["variables"][var_name] = var_value[1:-1]
+            else:
+                parsed_input["variables"][var_name] = var_value
+    return parsed_input
+
 
 
 def parse_output_data(output_text: str) -> Dict[str, Any]:

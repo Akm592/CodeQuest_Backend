@@ -1,5 +1,6 @@
 import json
 import re
+import time
 from typing import Any, AsyncGenerator, Dict, List, Optional
 
 from google import genai
@@ -29,6 +30,18 @@ chat_config = types.GenerateContentConfig(
     top_k=20,
     max_output_tokens=10000,
 )
+
+# Faster, more deterministic config for classification
+classification_config = types.GenerateContentConfig(
+    temperature=0.0,
+    top_p=0.95,
+    top_k=40,
+    max_output_tokens=100,
+)
+
+# Simple in-memory cache for intent classification
+_intent_cache: Dict[str, str] = {}
+MAX_CACHE_SIZE = 100
 
 
 def clean_json_response(raw_text: str) -> str:
@@ -202,32 +215,43 @@ async def get_contextual_visualization_data(
 # """
 
 async def classify_intent_with_llm(user_query: str) -> str:
-    """Uses the LLM to classify the user's intent."""
+    """Uses the LLM to classify the user's intent with in-memory caching."""
+    # Normalize query for better cache hits
+    normalized_query = user_query.strip().lower()
+    
+    # Check cache first
+    if normalized_query in _intent_cache:
+        logger.info(f"Cache hit for intent: '{normalized_query[:30]}...' -> {_intent_cache[normalized_query]}")
+        return _intent_cache[normalized_query]
+
     try:
-        # Use the standard chat model for this quick task. It's configured for fast responses.
+        start_time = time.perf_counter()
         prompt = INTENT_CLASSIFICATION_PROMPT.format(user_query=user_query)
 
-        # We need a quick, non-streaming response for classification.
         response = await client.aio.models.generate_content(
             model=DEFAULT_MODEL,
             contents=prompt,
-            config=chat_config,
+            config=classification_config,
         )
 
-        # The response should be a single, clean word.
-        # .strip() handles leading/trailing whitespace. .lower() ensures consistency.
         intent = response.text.strip().lower()
+        duration = time.perf_counter() - start_time
 
-        # Validate the response from the LLM to ensure it's one of our expected categories.
         if intent in ["visualization", "cs_tutor", "general"]:
-            logger.info(f"LLM classified intent for '{user_query[:60]}...' as: {intent}")
+            logger.info(f"LLM classified intent for '{user_query[:60]}...' as: {intent} (took {duration:.2f}s)")
+            
+            # Update cache (simple FIFO-ish pruning if it gets too big)
+            if len(_intent_cache) >= MAX_CACHE_SIZE:
+                # Remove a random key or first key if needed, here just clearing oldest entry
+                oldest_key = next(iter(_intent_cache))
+                del _intent_cache[oldest_key]
+            
+            _intent_cache[normalized_query] = intent
             return intent
         else:
-            # If the LLM returns something unexpected (e.g., an explanation), log it and default.
             logger.warning(f"LLM returned an invalid intent classification: '{intent}'. Defaulting to 'general'.")
             return "general"
 
     except Exception as e:
         logger.error(f"Error during LLM intent classification: {e}. Defaulting to 'general'.")
-        # In case of an API error, we default to the safest, most general category.
         return "general"

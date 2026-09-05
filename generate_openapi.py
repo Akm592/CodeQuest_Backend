@@ -1,4 +1,5 @@
 import json
+
 from app.main import app
 
 openapi_schema = app.openapi()

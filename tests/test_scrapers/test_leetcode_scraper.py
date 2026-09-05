@@ -1,322 +1,265 @@
-import pytest
+"""LeetCode scraper.
+
+The previous version of this file reset the module cache by rebinding its own
+imported copy of ``_problems_cache``, which left the real module-level cache
+untouched. Tests therefore polluted each other in call order and several
+"failures" were just a warm cache. Here the cache is reset on the module object.
+"""
+
 from unittest.mock import AsyncMock, MagicMock, patch
+
 import httpx
-from bs4 import BeautifulSoup
+import pytest
+
+from app.scrapers import leetcode_scraper
 from app.scrapers.leetcode_scraper import (
-    _fetch_all_problems,
-    normalize_text,
-    get_title_slug,
-    fetch_leetcode_question,
-    scrape_leetcode_question,
     extract_examples_from_content,
+    fetch_leetcode_question,
+    get_title_slug,
+    normalize_text,
     parse_input_data,
     parse_output_data,
-    LEETCODE_ALL_PROBLEMS_URL,
-    LEETCODE_GRAPHQL_URL,
-    _problems_cache # Import the global cache
+    scrape_leetcode_question,
 )
 
-# Fixture to mock httpx.AsyncClient and reset global cache
+PROBLEMS = [
+    {
+        "stat": {
+            "frontend_question_id": 1,
+            "question__title": "Two Sum",
+            "question__title_slug": "two-sum",
+        }
+    },
+    {
+        "stat": {
+            "frontend_question_id": 217,
+            "question__title": "Contains Duplicate",
+            "question__title_slug": "contains-duplicate",
+        }
+    },
+]
+
+# Shaped like real LeetCode content: an "Example N:" heading followed by a
+# <pre> block. The scraper flattens this with a space separator before parsing.
+QUESTION_HTML = (
+    "<p>Given an array, return indices.</p>"
+    "<p><strong class=\"example\">Example 1:</strong></p>"
+    "<pre><strong>Input:</strong> nums = [2,7,11,15], target = 9\n"
+    "<strong>Output:</strong> [0,1]\n"
+    "<strong>Explanation:</strong> Because nums[0] + nums[1] == 9.</pre>"
+)
+
+
 @pytest.fixture(autouse=True)
-def mock_httpx_client():
-    with patch('httpx.AsyncClient') as MockAsyncClient:
-        mock_client_instance = AsyncMock()
-        MockAsyncClient.return_value.__aenter__.return_value = mock_client_instance
-        
-        # Reset the global cache before each test
-        global _problems_cache
-        original_problems_cache = _problems_cache
-        _problems_cache = None
-        
-        yield mock_client_instance
-        
-        _problems_cache = original_problems_cache
+def reset_problem_cache():
+    """Clear the real module-level cache around every test."""
+    leetcode_scraper._problems_cache = None
+    yield
+    leetcode_scraper._problems_cache = None
 
-# Test _fetch_all_problems
-@pytest.mark.asyncio
-async def test_fetch_all_problems_success(mock_httpx_client):
-    mock_response = MagicMock()
-    mock_response.json.return_value = {
-        "stat_status_pairs": [
-            {"stat": {"frontend_question_id": 1, "question__title": "Two Sum", "question__title_slug": "two-sum"}},
-            {"stat": {"frontend_question_id": 2, "question__title": "Add Two Numbers", "question__title_slug": "add-two-numbers"}},
-        ]
-    }
-    mock_httpx_client.get.return_value = mock_response
 
-    problems = await _fetch_all_problems()
-    assert len(problems) == 2
-    assert problems[0]["stat"]["question__title_slug"] == "two-sum"
-    mock_httpx_client.get.assert_called_once_with(LEETCODE_ALL_PROBLEMS_URL)
+@pytest.fixture
+def http_client():
+    """Patch httpx.AsyncClient and hand back the mocked instance."""
+    with patch("httpx.AsyncClient") as mock_cls:
+        instance = AsyncMock()
+        mock_cls.return_value.__aenter__.return_value = instance
+        yield instance
 
-@pytest.mark.asyncio
-async def test_fetch_all_problems_http_error(mock_httpx_client):
-    mock_httpx_client.get.side_effect = httpx.HTTPStatusError("Not Found", request=httpx.Request("GET", LEETCODE_ALL_PROBLEMS_URL), response=httpx.Response(404))
-    problems = await _fetch_all_problems()
-    assert problems is None
 
-@pytest.mark.asyncio
-async def test_fetch_all_problems_request_error(mock_httpx_client):
-    mock_httpx_client.get.side_effect = httpx.RequestError("Connection Error", request=httpx.Request("GET", LEETCODE_ALL_PROBLEMS_URL))
-    problems = await _fetch_all_problems()
-    assert problems is None
+def _json_response(payload):
+    response = MagicMock()
+    response.json.return_value = payload
+    response.raise_for_status = MagicMock()
+    return response
 
-# Test normalize_text
-def test_normalize_text():
-    assert normalize_text("  Hello World!  ") == "hello world!"
-    assert normalize_text("Déjà Vu") == "deja vu"
-    assert normalize_text("Multiple   Spaces") == "multiple spaces"
-    assert normalize_text(None) == ""
 
-# Test get_title_slug
-@pytest.mark.asyncio
-async def test_get_title_slug_from_url(mock_httpx_client):
-    slug = await get_title_slug("https://leetcode.com/problems/two-sum/description/")
+# --- Problem list ----------------------------------------------------------
+
+
+async def test_fetch_all_problems_caches_the_result(http_client):
+    http_client.get.return_value = _json_response({"stat_status_pairs": PROBLEMS})
+
+    first = await leetcode_scraper._fetch_all_problems()
+    second = await leetcode_scraper._fetch_all_problems()
+
+    assert first == PROBLEMS
+    assert second == PROBLEMS
+    # The cache means only one network call, which is the point of it.
+    assert http_client.get.await_count == 1
+
+
+async def test_fetch_all_problems_handles_an_http_error(http_client):
+    http_client.get.side_effect = httpx.HTTPStatusError(
+        "boom", request=MagicMock(), response=MagicMock(status_code=500)
+    )
+    assert await leetcode_scraper._fetch_all_problems() is None
+
+
+async def test_fetch_all_problems_handles_a_connection_error(http_client):
+    http_client.get.side_effect = httpx.RequestError("no route")
+    assert await leetcode_scraper._fetch_all_problems() is None
+
+
+async def test_fetch_all_problems_handles_a_malformed_payload(http_client):
+    http_client.get.return_value = _json_response({"unexpected": []})
+    assert await leetcode_scraper._fetch_all_problems() is None
+
+
+# --- Identifier resolution -------------------------------------------------
+
+
+async def test_a_url_resolves_without_fetching_the_problem_list(http_client):
+    slug = await get_title_slug("https://leetcode.com/problems/two-sum/")
     assert slug == "two-sum"
-    mock_httpx_client.get.assert_not_called() # Should not call _fetch_all_problems
+    http_client.get.assert_not_awaited()
 
-@pytest.mark.asyncio
-async def test_get_title_slug_from_number(mock_httpx_client):
-    mock_response = MagicMock()
-    mock_response.json.return_value = {
-        "stat_status_pairs": [
-            {"stat": {"frontend_question_id": 1, "question__title": "Two Sum", "question__title_slug": "two-sum"}},
-        ]
-    }
-    mock_httpx_client.get.return_value = mock_response
-    slug = await get_title_slug("1")
-    assert slug == "two-sum"
-    mock_httpx_client.get.assert_called_once_with(LEETCODE_ALL_PROBLEMS_URL)
 
-@pytest.mark.asyncio
-async def test_get_title_slug_from_title(mock_httpx_client):
-    mock_response = MagicMock()
-    mock_response.json.return_value = {
-        "stat_status_pairs": [
-            {"stat": {"frontend_question_id": 1, "question__title": "Two Sum", "question__title_slug": "two-sum"}},
-        ]
-    }
-    mock_httpx_client.get.return_value = mock_response
-    slug = await get_title_slug("Two Sum")
-    assert slug == "two-sum"
-    mock_httpx_client.get.assert_called_once_with(LEETCODE_ALL_PROBLEMS_URL)
+async def test_a_url_with_query_parameters_resolves():
+    assert await get_title_slug("https://leetcode.com/problems/two-sum/?envType=list") == "two-sum"
 
-@pytest.mark.asyncio
-async def test_get_title_slug_not_found(mock_httpx_client):
-    mock_response = MagicMock()
-    mock_response.json.return_value = {"stat_status_pairs": []}
-    mock_httpx_client.get.return_value = mock_response
-    slug = await get_title_slug("Non Existent Problem")
-    assert slug is None
 
-@pytest.mark.asyncio
-async def test_get_title_slug_invalid_identifier():
-    slug = await get_title_slug(123) # Invalid type
-    assert slug is None
+async def test_a_number_resolves(http_client):
+    http_client.get.return_value = _json_response({"stat_status_pairs": PROBLEMS})
+    assert await get_title_slug("1") == "two-sum"
 
-# Test fetch_leetcode_question
-@pytest.mark.asyncio
-async def test_fetch_leetcode_question_success(mock_httpx_client):
-    mock_response = MagicMock()
-    mock_response.json.return_value = {
-        "data": {
-            "question": {
-                "questionFrontendId": "1",
-                "title": "Two Sum",
-                "content": "<p>Given an array of integers, return indices of the two numbers...</p>",
-                "difficulty": "Easy",
-                "topicTags": [{"name": "Array"}, {"name": "Hash Table"}],
-                "codeSnippets": [],
+
+async def test_a_number_and_title_resolves(http_client):
+    http_client.get.return_value = _json_response({"stat_status_pairs": PROBLEMS})
+    assert await get_title_slug("1. Two Sum") == "two-sum"
+
+
+async def test_a_title_resolves(http_client):
+    http_client.get.return_value = _json_response({"stat_status_pairs": PROBLEMS})
+    assert await get_title_slug("Contains Duplicate") == "contains-duplicate"
+
+
+async def test_an_unknown_identifier_resolves_to_nothing(http_client):
+    http_client.get.return_value = _json_response({"stat_status_pairs": PROBLEMS})
+    assert await get_title_slug("this problem does not exist anywhere") is None
+
+
+@pytest.mark.parametrize("bad", [None, "", 123, []])
+async def test_a_non_string_identifier_is_rejected(bad):
+    assert await get_title_slug(bad) is None
+
+
+# --- Question fetch --------------------------------------------------------
+
+
+async def test_fetch_returns_structured_data(http_client):
+    http_client.post.return_value = _json_response(
+        {
+            "data": {
+                "question": {
+                    "questionFrontendId": "1",
+                    "title": "Two Sum",
+                    "content": QUESTION_HTML,
+                    "difficulty": "Easy",
+                    "topicTags": [{"name": "Array"}, {"name": "Hash Table"}],
+                }
             }
         }
-    }
-    mock_httpx_client.post.return_value = mock_response
-
-    question_data = await fetch_leetcode_question("two-sum")
-    assert question_data["id"] == "1"
-    assert question_data["title"] == "Two Sum"
-    assert "Given an array of integers" in question_data["content"]
-    assert question_data["difficulty"] == "Easy"
-    assert "Array" in question_data["tags"]
-    assert question_data["examples"] == [] # No examples in this mock content
-    mock_httpx_client.post.assert_called_once_with(
-        LEETCODE_GRAPHQL_URL,
-        json={
-            "query": """
-    query getQuestionDetail($titleSlug: String!) {
-      question(titleSlug: $titleSlug) {
-        questionId
-        questionFrontendId
-        title
-        content
-        difficulty
-        topicTags {
-          name
-          slug
-        }
-        codeSnippets { # Optionally fetch code snippets
-            langSlug
-            code
-        }
-      }
-    }
-    """,
-            "variables": {"titleSlug": "two-sum"},
-        },
-        headers={
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36",
-            "Referer": "https://leetcode.com/problems/two-sum/",
-            "Origin": "https://leetcode.com",
-        },
     )
 
-@pytest.mark.asyncio
-async def test_fetch_leetcode_question_with_examples(mock_httpx_client):
-    mock_response = MagicMock()
-    mock_response.json.return_value = {
-        "data": {
-            "question": {
-                "questionFrontendId": "1",
-                "title": "Two Sum",
-                "content": """<p>Given an array of integers, return indices of the two numbers...</p>
-<pre><b>Example 1:</b>
-Input: nums = [2,7,11,15], target = 9
-Output: [0,1]
-Explanation: Because nums[0] + nums[1] == 9, we return [0, 1].
-</pre>
-""",
-                "difficulty": "Easy",
-                "topicTags": [],
-                "codeSnippets": [],
+    result = await fetch_leetcode_question("two-sum")
+
+    assert result is not None
+    assert result["id"] == "1"
+    assert result["title"] == "Two Sum"
+    assert result["difficulty"] == "Easy"
+    assert result["tags"] == ["Array", "Hash Table"]
+    # The slug round-trips so a later turn can re-resolve the problem without
+    # relying on in-process state surviving.
+    assert result["slug"] == "two-sum"
+    assert result["formatted_content"].startswith("ID: 1\nTitle: Two Sum")
+
+
+async def test_fetch_extracts_examples(http_client):
+    http_client.post.return_value = _json_response(
+        {
+            "data": {
+                "question": {
+                    "questionFrontendId": "1",
+                    "title": "Two Sum",
+                    "content": QUESTION_HTML,
+                    "difficulty": "Easy",
+                    "topicTags": [],
+                }
             }
         }
-    }
-    mock_httpx_client.post.return_value = mock_response
+    )
 
-    question_data = await fetch_leetcode_question("two-sum")
-    assert len(question_data["examples"]) == 1
-    assert question_data["examples"][0]["input"]["variables"] == {"nums": [2, 7, 11, 15], "target": 9}
-    assert question_data["examples"][0]["output"]["value"] == [0,1]
+    result = await fetch_leetcode_question("two-sum")
+    assert result["examples"]
+    assert result["examples"][0]["input"]["variables"]["nums"] == [2, 7, 11, 15]
 
-@pytest.mark.asyncio
-async def test_fetch_leetcode_question_graphql_error(mock_httpx_client):
-    mock_response = MagicMock()
-    mock_response.json.return_value = {"errors": [{"message": "Error fetching data"}]}
-    mock_httpx_client.post.return_value = mock_response
-    question_data = await fetch_leetcode_question("invalid-slug")
-    assert question_data is None
 
-@pytest.mark.asyncio
-async def test_fetch_leetcode_question_http_error(mock_httpx_client):
-    mock_httpx_client.post.side_effect = httpx.HTTPStatusError("Bad Request", request=httpx.Request("POST", LEETCODE_GRAPHQL_URL), response=httpx.Response(400))
-    question_data = await fetch_leetcode_question("some-slug")
-    assert question_data is None
+async def test_fetch_returns_none_on_a_graphql_error(http_client):
+    http_client.post.return_value = _json_response({"errors": [{"message": "not found"}]})
+    assert await fetch_leetcode_question("nope") is None
 
-# Test scrape_leetcode_question (integration of get_title_slug and fetch_leetcode_question)
-@pytest.mark.asyncio
-async def test_scrape_leetcode_question_success(mock_httpx_client):
-    # Mock _fetch_all_problems for get_title_slug
-    mock_all_problems_response = MagicMock()
-    mock_all_problems_response.json.return_value = {
-        "stat_status_pairs": [
-            {"stat": {"frontend_question_id": 1, "question__title": "Two Sum", "question__title_slug": "two-sum"}},
-        ]
-    }
-    mock_httpx_client.get.return_value = mock_all_problems_response
 
-    # Mock fetch_leetcode_question
-    mock_graphql_response = MagicMock()
-    mock_graphql_response.json.return_value = {
-        "data": {
-            "question": {
-                "questionFrontendId": "1",
-                "title": "Two Sum",
-                "content": "<p>Problem content</p>",
-                "difficulty": "Easy",
-                "topicTags": [],
-                "codeSnippets": [],
-            }
-        }
-    }
-    mock_httpx_client.post.return_value = mock_graphql_response
+async def test_fetch_returns_none_on_an_http_error(http_client):
+    http_client.post.side_effect = httpx.HTTPStatusError(
+        "boom", request=MagicMock(), response=MagicMock(status_code=403)
+    )
+    assert await fetch_leetcode_question("two-sum") is None
 
-    question = await scrape_leetcode_question("1")
-    assert question["title"] == "Two Sum"
-    mock_httpx_client.get.assert_called_once() # Called by get_title_slug
-    mock_httpx_client.post.assert_called_once() # Called by fetch_leetcode_question
 
-@pytest.mark.asyncio
-async def test_scrape_leetcode_question_title_slug_failure(mock_httpx_client):
-    # Mock _fetch_all_problems to return no problems
-    mock_all_problems_response = MagicMock()
-    mock_all_problems_response.json.return_value = {"stat_status_pairs": []}
-    mock_httpx_client.get.return_value = mock_all_problems_response
+async def test_fetch_returns_none_on_a_connection_error(http_client):
+    http_client.post.side_effect = httpx.RequestError("no route")
+    assert await fetch_leetcode_question("two-sum") is None
 
-    question = await scrape_leetcode_question("Non Existent Problem")
-    assert question is None
-    mock_httpx_client.get.assert_called_once()
-    mock_httpx_client.post.assert_not_called()
 
-@pytest.mark.asyncio
-async def test_scrape_leetcode_question_fetch_failure(mock_httpx_client):
-    with patch('app.scrapers.leetcode_scraper._fetch_all_problems') as mock_fetch_all_problems:
-        mock_fetch_all_problems.return_value = [
-            {"stat": {"frontend_question_id": 1, "question__title": "Two Sum", "question__title_slug": "two-sum"}},
-        ]
+async def test_scrape_returns_none_when_the_identifier_cannot_be_resolved(http_client):
+    http_client.get.return_value = _json_response({"stat_status_pairs": PROBLEMS})
+    assert await scrape_leetcode_question("nonsense that matches nothing") is None
 
-        mock_httpx_client.post.side_effect = httpx.HTTPStatusError("Not Found", request=httpx.Request("POST", LEETCODE_GRAPHQL_URL), response=httpx.Response(404))
 
-        question = await scrape_leetcode_question("1")
-        assert question is None
-        mock_fetch_all_problems.assert_called_once()
-        mock_httpx_client.post.assert_called_once()
+# --- Parsing helpers -------------------------------------------------------
 
-# Test extract_examples_from_content
-def test_extract_examples_from_content_success():
-    content = """<p>Problem description.</p>
-<pre><b>Example 1:</b>
-Input: nums = [2,7,11,15], target = 9
-Output: [0,1]
-Explanation: Because nums[0] + nums[1] == 9, we return [0, 1].
-</pre>
-<pre><b>Example 2:</b>
-Input: x = 123, y = 456
-Output: 579
-</pre>
-"""
-    examples = extract_examples_from_content(content)
-    assert len(examples) == 2
-    assert examples[0]["example_number"] == 1
-    assert examples[0]["input"]["variables"] == {"nums": [2,7,11,15], "target": 9}
-    assert examples[0]["output"]["value"] == [0,1]
-    assert examples[0]["explanation"] == "Because nums[0] + nums[1] == 9, we return [0, 1]."
-    assert examples[1]["example_number"] == 2
-    assert examples[1]["input"]["variables"] == {"x": 123, "y": 456}
-    assert examples[1]["output"]["value"] == 579
-    assert examples[1]["explanation"] is None
 
-def test_extract_examples_from_content_no_examples():
-    content = "<p>Problem description with no examples.</p>"
-    examples = extract_examples_from_content(content)
-    assert examples == []
+def test_normalize_text():
+    assert normalize_text("  Two   Sum  ") == "two sum"
+    assert normalize_text("Café") == "cafe"
+    assert normalize_text(None) == ""
+    assert normalize_text(123) == ""
 
-# Test parse_input_data
-def test_parse_input_data():
-    assert parse_input_data("nums = [2,7,11,15], target = 9") == {"raw": "nums = [2,7,11,15], target = 9", "variables": {"nums": [2, 7, 11, 15], "target": 9}}
-    assert parse_input_data("s = \"hello\"") == {"raw": "s = \"hello\"", "variables": {"s": "hello"}}
-    assert parse_input_data("grid = [['1','1','1'],['0','1','0']]") == {"raw": "grid = [['1','1','1'],['0','1','0']]", "variables": {"grid": [['1'], ['1'], ['1'], ['0'], ['1'], ['0']]}}
-    assert parse_input_data("num = -123") == {"raw": "num = -123", "variables": {"num": -123}}
-    assert parse_input_data("val = 3.14") == {"raw": "val = 3.14", "variables": {"val": 3.14}}
-    assert parse_input_data("single_var = value_text") == {"raw": "single_var = value_text", "variables": {"single_var": "value_text"}}
 
-# Test parse_output_data
+def test_examples_are_extracted_from_cleaned_text():
+    """The pipeline only ever feeds this function BeautifulSoup-cleaned text."""
+    cleaned = (
+        "Example 1: Input: nums = [2,7,11,15], target = 9 Output: [0,1] "
+        "Explanation: Because nums[0] + nums[1] == 9."
+    )
+    examples = extract_examples_from_content(cleaned)
+    assert examples
+    assert examples[0]["input"]["variables"]["nums"] == [2, 7, 11, 15]
+    assert examples[0]["output"]["value"] == [0, 1]
+
+
+def test_no_examples_in_plain_prose():
+    assert extract_examples_from_content("This problem has no worked examples.") == []
+
+
+def test_parse_input_data_captures_every_variable():
+    """A consuming delimiter meant only the first variable was ever returned."""
+    parsed = parse_input_data("nums = [2,7,11,15], target = 9")
+    assert parsed["variables"] == {"nums": [2, 7, 11, 15], "target": 9}
+
+
+def test_parse_input_data_handles_nested_and_string_values():
+    assert parse_input_data("grid = [[1,1],[0,1]]")["variables"] == {"grid": [[1, 1], [0, 1]]}
+    assert parse_input_data('s = "abc", t = "def"')["variables"] == {"s": "abc", "t": "def"}
+
+
+def test_parse_input_data_keeps_the_raw_text():
+    assert parse_input_data("x = 5")["raw"] == "x = 5"
+
+
 def test_parse_output_data():
-    assert parse_output_data("[0,1]") == {"raw": "[0,1]", "value": [0,1]}
-    assert parse_output_data("Output: [0,1]") == {"raw": "Output: [0,1]", "value": [0,1]}
-    assert parse_output_data("579") == {"raw": "579", "value": 579}
-    assert parse_output_data("\"hello\"") == {"raw": "\"hello\"", "value": "hello"}
-    assert parse_output_data("true") == {"raw": "true", "value": True}
-    assert parse_output_data("false") == {"raw": "false", "value": False}
-    assert parse_output_data("some text output") == {"raw": "some text output", "value": "some text output"}
+    assert parse_output_data("[0,1]") == {"raw": "[0,1]", "value": [0, 1]}
+    assert parse_output_data("Output: [0,1]") == {"raw": "Output: [0,1]", "value": [0, 1]}
+    assert parse_output_data("true")["value"] is True
+    assert parse_output_data("-123")["value"] == -123

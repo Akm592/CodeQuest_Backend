@@ -1,156 +1,206 @@
-# app/database/supabase_client.py
-import uuid  # Import uuid if needed for validation within the class
-from typing import Dict, List, Optional  # Ensure Dict is imported
+"""Supabase access, scoped to the calling user.
 
-from supabase import Client, create_client
+Two changes from the original here, both load-bearing:
+
+1. The client is now the *async* one. Every method was already ``async def`` but
+   called the synchronous client underneath, so each database round trip blocked
+   the event loop — on a single free-tier worker that stalls every concurrent SSE
+   stream.
+
+2. Queries run as the caller, by forwarding their JWT, so the row level security
+   policies in ``supabase/migrations`` apply. The backend physically cannot read
+   another user's rows even if the application logic above it is wrong.
+
+Note the deliberate avoidance of ``client.postgrest.auth(token)``: that mutates
+headers on the shared client instance, so two concurrent requests can interleave
+and run one user's query under another user's token.
+"""
+
+import time
+import uuid
+from typing import Dict, List, Optional, Tuple
+
+from supabase import AsyncClient, AsyncClientOptions, acreate_client
 
 from app.core.config import settings
 from app.core.logger import logger
 
+# Building a client per request is wasteful, so keep them briefly, keyed by
+# token digest. TTL is short because a client outlives the token's validity
+# otherwise.
+_CLIENT_TTL_SECONDS = 300
+_CLIENT_CACHE_MAX = 128
+_client_cache: Dict[str, Tuple[float, AsyncClient]] = {}
+
+
+def reset_client_cache() -> None:
+    """Drop cached clients. Used by tests."""
+    _client_cache.clear()
+
+
+def _is_uuid(value: str) -> bool:
+    try:
+        uuid.UUID(str(value))
+        return True
+    except (ValueError, AttributeError, TypeError):
+        return False
+
+
+async def get_user_client(access_token: str) -> AsyncClient:
+    """Return a Supabase client that acts as the holder of ``access_token``."""
+    import hashlib
+
+    key = hashlib.sha256(access_token.encode("utf-8")).hexdigest()
+    now = time.monotonic()
+
+    entry = _client_cache.get(key)
+    if entry and entry[0] > now:
+        return entry[1]
+
+    client = await acreate_client(
+        settings.SUPABASE_URL,
+        settings.SUPABASE_ANON_KEY,
+        options=AsyncClientOptions(headers={"Authorization": f"Bearer {access_token}"}),
+    )
+
+    if len(_client_cache) >= _CLIENT_CACHE_MAX:
+        oldest = min(_client_cache, key=lambda k: _client_cache[k][0])
+        _client_cache.pop(oldest, None)
+    _client_cache[key] = (now + _CLIENT_TTL_SECONDS, client)
+    return client
+
 
 class SupabaseManager:
-    _client: Optional[Client] = None
+    """Database operations for one authenticated user."""
+
+    def __init__(self, client: AsyncClient, user_id: str):
+        self._client = client
+        self._user_id = user_id
 
     @classmethod
-    def get_client(cls) -> Client:
-        """Initialize and return the Supabase client."""
-        if cls._client is None:
-            try:
-                cls._client = create_client(
-                    settings.SUPABASE_URL, settings.SUPABASE_ANON_KEY
-                )
-                logger.info("Successfully connected to Supabase.")
-            except Exception as e:
-                logger.error(f"Failed to initialize Supabase client: {e}")
-                raise
-        return cls._client
+    async def for_user(cls, user) -> "SupabaseManager":
+        """Build a manager acting as ``user`` (an ``AuthenticatedUser``)."""
+        client = await get_user_client(user.access_token)
+        return cls(client, user.id)
 
-    @classmethod
     async def create_chat_session(
-        cls, user_id: str, session_id: str, session_name: str = "New Chat"
+        self, session_id: str, session_name: str = "New Chat"
     ) -> bool:
-        """Create a new chat session in the database.
-        Note: This is only called for authenticated users. Guest sessions are ephemeral.
+        """Create a chat session owned by this user."""
+        if not _is_uuid(session_id):
+            logger.error("create_chat_session called with a non-uuid session id.")
+            return False
+        try:
+            await (
+                self._client.table("chat_sessions")
+                .insert(
+                    {
+                        "id": str(session_id),
+                        "session_name": session_name,
+                        "user_id": self._user_id,
+                    }
+                )
+                .execute()
+            )
+            logger.info(f"Created chat session {session_id}.")
+            return True
+        except Exception as exc:
+            logger.error(f"Error creating chat session {session_id}: {exc}", exc_info=True)
+            return False
+
+    async def get_session_by_id(self, session_id: str) -> Optional[Dict]:
+        """Fetch one of *this user's* sessions. Returns None if it isn't theirs."""
+        if not _is_uuid(session_id):
+            return None
+        try:
+            response = await (
+                self._client.table("chat_sessions")
+                .select("*")
+                .eq("id", str(session_id))
+                .eq("user_id", self._user_id)
+                .limit(1)
+                .execute()
+            )
+            return response.data[0] if response.data else None
+        except Exception as exc:
+            logger.error(f"Error retrieving session {session_id}: {exc}", exc_info=True)
+            return None
+
+    async def owns_session(self, session_id: str) -> bool:
+        """Whether this user owns the session."""
+        return await self.get_session_by_id(session_id) is not None
+
+    async def ensure_session_owned(
+        self, session_id: str, session_name: str = "New Chat"
+    ) -> bool:
+        """Confirm the caller owns the session, creating it if it doesn't exist.
+
+        The frontend mints session UUIDs client-side, so a first message can
+        legitimately arrive before any row exists. Creating it here also closes
+        the gap where a caller could write messages into a session id belonging
+        to somebody else.
         """
-        try:
-            client = cls.get_client()
-            # Ensure session_id is string
-            session_id_str = str(session_id)
-            # Basic validation
-            uuid.UUID(session_id_str)
-
-            insert_data = {
-                "id": session_id_str,
-                "session_name": session_name,
-                "user_id": user_id,
-            }
-
-            response = client.table("chat_sessions").insert(insert_data).execute()
-            # Optional: Check response status or errors if execute() provides them
-            # if response.error: logger.error(...) return False
-            logger.info(f"Successfully inserted chat session {session_id_str}")
+        if not _is_uuid(session_id):
+            return False
+        existing = await self.get_session_by_id(session_id)
+        if existing is not None:
             return True
-        except ValueError:
-            logger.error(f"Invalid session_id format provided to create_chat_session: {session_id}")
-            return False
-        except Exception as e:
-            logger.error(f"Error creating chat session {session_id}: {str(e)}", exc_info=True)
-            return False
 
-    # --- ADD THIS METHOD ---
-    @classmethod
-    async def get_session_by_id(cls, session_id: str) -> Optional[Dict]:
-        """Retrieve a specific chat session by its ID."""
+        # Not ours. It may not exist at all, or it may belong to another user —
+        # RLS hides which, and the insert below fails safely in the latter case.
+        return await self.create_chat_session(session_id, session_name=session_name)
+
+    async def get_chat_sessions(self) -> Optional[List[Dict]]:
+        """All of this user's sessions, newest first."""
         try:
-            # Validate UUID format before querying
-            session_uuid = uuid.UUID(session_id)
-            client = cls.get_client()
-            response = (
-                client.table("chat_sessions")
+            response = await (
+                self._client.table("chat_sessions")
                 .select("*")
-                .eq("id", str(session_uuid)) # Query using the validated string UUID
-                .limit(1) # Optimization: We only expect one session
+                .eq("user_id", self._user_id)
+                .order("created_at", desc=True)
                 .execute()
             )
-            # Check if data was returned
-            if response.data:
-                logger.debug(f"Found session data for ID {session_id}")
-                return response.data[0] # Return the first (and only) dictionary
-            else:
-                logger.debug(f"No session found in DB for ID {session_id}")
-                return None
-        except ValueError:
-            logger.error(f"Invalid session_id format passed to get_session_by_id: {session_id}")
-            return None # Invalid format, cannot exist in DB
-        except Exception as e:
-            logger.error(f"Error retrieving session by ID '{session_id}': {str(e)}", exc_info=True)
+            return response.data
+        except Exception as exc:
+            logger.error(f"Error retrieving chat sessions: {exc}", exc_info=True)
             return None
-    # --- END OF ADDED METHOD ---
 
-
-    @classmethod
-    async def get_chat_sessions_for_user(cls, user_id: str) -> Optional[List[Dict]]:
-        """Retrieve all chat sessions for a given user."""
-        try:
-            client = cls.get_client()
-            response = (
-                client.table("chat_sessions")
-                .select("*")
-                .eq("user_id", user_id)
-                .order("created_at", desc=True) # Optional: Order by creation time
-                .execute()
-            )
-            return response.data # Will be [] if no sessions found, None only on error
-        except Exception as e:
-            logger.error(f"Error retrieving chat sessions for user {user_id}: {str(e)}", exc_info=True)
-            return None # Indicate error occurred
-
-    @classmethod
-    async def get_messages_by_session_id(cls, session_id: str) -> Optional[List[Dict]]:
-        """Retrieve all messages for a given session, ordered by timestamp."""
-        try:
-             # Validate UUID format before querying
-            session_uuid = uuid.UUID(session_id)
-            client = cls.get_client()
-            response = (
-                client.table("messages")
-                .select("*")
-                .eq("session_id", str(session_uuid))
-                .order("created_at", desc=False) # Order messages chronologically
-                .execute()
-            )
-            return response.data # Will be [] if no messages found, None only on error
-        except ValueError:
-            logger.error(f"Invalid session_id format passed to get_messages_by_session_id: {session_id}")
+    async def get_messages_by_session_id(self, session_id: str) -> Optional[List[Dict]]:
+        """Messages for a session the caller owns, oldest first."""
+        if not _is_uuid(session_id):
             return None
-        except Exception as e:
-            logger.error(f"Error retrieving messages for session {session_id}: {str(e)}", exc_info=True)
-            return None # Indicate error occurred
-
-    @classmethod
-    async def update_chat_session_name(cls, session_id: str, session_name: str) -> bool:
-        """Update the name of a chat session."""
         try:
-            # Validate UUID format before querying
-            session_uuid = uuid.UUID(session_id)
-            client = cls.get_client()
-            response = client.table("chat_sessions").update(
-                {"session_name": session_name}
-            ).eq("id", str(session_uuid)).execute()
-            # Optional: Check if update actually affected rows if API provides count
-            # For now, assume success if no exception
-            logger.info(f"Updated session name for {session_id} to '{session_name}'")
+            response = await (
+                self._client.table("messages")
+                .select("*")
+                .eq("session_id", str(session_id))
+                .order("created_at", desc=False)
+                .execute()
+            )
+            return response.data
+        except Exception as exc:
+            logger.error(f"Error retrieving messages for {session_id}: {exc}", exc_info=True)
+            return None
+
+    async def update_chat_session_name(self, session_id: str, session_name: str) -> bool:
+        """Rename one of this user's sessions."""
+        if not _is_uuid(session_id):
+            return False
+        try:
+            await (
+                self._client.table("chat_sessions")
+                .update({"session_name": session_name})
+                .eq("id", str(session_id))
+                .eq("user_id", self._user_id)
+                .execute()
+            )
             return True
-        except ValueError:
-            logger.error(f"Invalid session_id format passed to update_chat_session_name: {session_id}")
-            return False
-        except Exception as e:
-            logger.error(f"Error updating session name for {session_id}: {str(e)}", exc_info=True)
+        except Exception as exc:
+            logger.error(f"Error renaming session {session_id}: {exc}", exc_info=True)
             return False
 
-    @classmethod
     async def store_message(
-        cls,
+        self,
         session_id: str,
         sender_type: str,
         content: str,
@@ -159,34 +209,30 @@ class SupabaseManager:
         parent_message_id: Optional[str] = None,
         metadata: Optional[Dict] = None,
     ) -> bool:
-        """Store a message in the database."""
-        try:
-            session_uuid = uuid.UUID(session_id)
-            client = cls.get_client()
-            message_data = {
-                "session_id": str(session_uuid),
-                "sender_type": sender_type,
-                "content": content,
-                "intent": intent,
-                "visualization_data": visualization_data if visualization_data else None,
-                "parent_message_id": (
-                    str(uuid.UUID(parent_message_id)) if parent_message_id else None
-                ),
-                "metadata": metadata or {},
-            }
-
-            client.table("messages").insert(message_data).execute()
-            # Optional: Check for errors in response
-            # if response.error: logger.error(...) return False
-            logger.debug(f"Stored message for session {session_id} by {sender_type}")
-            return True
-        except ValueError:
-             logger.error(f"Invalid session_id or parent_message_id format for store_message. Session: {session_id}")
-             return False
-        except Exception as e:
-            # Log the actual data causing the error if possible (be careful with sensitive info)
-            logger.error(f"Exception storing message for session {session_id}: {str(e)}", exc_info=True)
-            # logger.debug(f"Message data attempted: {message_data}") # Uncomment for deep debugging
+        """Store a message. RLS rejects it if the session isn't the caller's."""
+        if not _is_uuid(session_id):
             return False
-
-# Note: migrate_chat_sessions method removed - guest sessions are ephemeral and don't need migration
+        try:
+            await (
+                self._client.table("messages")
+                .insert(
+                    {
+                        "session_id": str(session_id),
+                        "sender_type": sender_type,
+                        "content": content,
+                        "intent": intent,
+                        "visualization_data": visualization_data or None,
+                        "parent_message_id": (
+                            str(parent_message_id)
+                            if parent_message_id and _is_uuid(parent_message_id)
+                            else None
+                        ),
+                        "metadata": metadata or {},
+                    }
+                )
+                .execute()
+            )
+            return True
+        except Exception as exc:
+            logger.error(f"Error storing message for {session_id}: {exc}", exc_info=True)
+            return False

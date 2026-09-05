@@ -1,14 +1,34 @@
 [tool.ruff]
 line-length = 120
 target-version = "py311"
-exclude = ["app/llm/prompts.py"]
+exclude = ["app/llm/prompts.py", ".venv"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "N", "D"]
-ignore = ["D100", "D104", "D105", "D107"]
+ignore = ["D100", "D104", "D105", "D107", "D203", "D213"]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests are allowed to skip docstrings.
+"tests/*" = ["D101", "D102", "D103"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["app"]
+# The repo has a supabase/ directory for SQL migrations, which otherwise makes
+# ruff classify the supabase library itself as first-party.
+known-third-party = ["supabase"]
 
 [tool.ruff.format]
 quote-style = "double"
 indent-style = "space"
 skip-magic-trailing-comma = false
 line-ending = "auto"
+
+[tool.pytest.ini_options]
+# The suite is async throughout; without this every async test is skipped
+# with a "coroutine never awaited" warning rather than actually running.
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+]

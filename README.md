@@ -17,7 +17,7 @@ CodeQuest is an intelligent computer science tutoring chatbot designed to help u
 *   **Backend:** Python, FastAPI
 *   **LLM:** Google Gemini Pro
 *   **Database:** Supabase (PostgreSQL)
-*   **Web Scraping:** `BeautifulSoup`, `aiohttp`
+*   **Web Scraping:** `BeautifulSoup`, `httpx`
 *   **Testing:** `pytest`, `pytest-asyncio`
 *   **Linting:** `ruff`
 *   **Deployment:** Docker
@@ -28,19 +28,33 @@ CodeQuest is an intelligent computer science tutoring chatbot designed to help u
 /
 ├── app/                    # Core application code
 │   ├── api/                # API endpoint routers
-│   ├── core/               # Configuration, logging, exceptions
-│   ├── database/           # Supabase client
+│   ├── core/               # Config, logging, auth, rate limiting
+│   ├── database/           # Supabase client (scoped to the calling user)
 │   ├── llm/                # Gemini integration and prompts
-│   ├── memory/             # In-memory chat session management
-│   ├── rag/                # Retrieval-Augmented Generation (future)
-│   ├── schemas/            # Pydantic data models
+│   ├── memory/             # In-process chat session cache
+│   ├── schemas/            # Pydantic models and payload validation
 │   └── scrapers/           # LeetCode scraper
+├── supabase/migrations/    # Database schema and RLS policies
 ├── tests/                  # Pytest test suite
 ├── Dockerfile              # Docker build file
 ├── generate_openapi.py     # OpenAPI schema generator
-├── requirements.txt        # Python dependencies
-└── pyproject.toml          # Project configuration
+├── requirements.txt        # Pinned runtime dependencies
+├── requirements-dev.txt    # Test and lint dependencies
+└── pyproject.toml          # Ruff and pytest configuration
 ```
+
+## Authentication & data protection
+
+Requests with **no `Authorization` header** are guests: their sessions are
+ephemeral, nothing is persisted, and they are rate limited. Requests carrying a
+**valid Supabase JWT** are verified against Supabase, and every database query
+runs as that user so Row Level Security applies. A **present but invalid** token
+returns `401` rather than being silently downgraded to a guest.
+
+Before pointing this at a real Supabase project, apply
+`supabase/migrations/0001_chat_schema_rls.sql` — it defines the schema and the
+RLS policies. The anon key is public by design (the frontend ships it), so RLS is
+what actually protects user data. See [`supabase/README.md`](supabase/README.md).
 
 ## API Endpoints
 
@@ -102,7 +116,7 @@ CodeQuest is an intelligent computer science tutoring chatbot designed to help u
     ```
     GEMINI_API_KEY="your_gemini_api_key"
     SUPABASE_URL="your_supabase_project_url"
-    SUPABASE_KEY="your_supabase_anon_key"
+    SUPABASE_ANON_KEY="your_supabase_anon_key"
     ```
 
 ### Running the Application

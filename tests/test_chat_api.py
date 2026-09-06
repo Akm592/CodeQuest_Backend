@@ -1,81 +1,148 @@
+"""Endpoint tests, focused on the access-control behaviour that was broken."""
+
+from unittest.mock import AsyncMock, patch
+
 import pytest
-from unittest.mock import MagicMock, patch, AsyncMock
-from fastapi.testclient import TestClient
-from fastapi import HTTPException
 
-# Patch settings before importing app to avoid validation errors
-with patch("app.core.config.Settings") as MockSettings:
-    MockSettings.return_value.GEMINI_API_KEY = "dummy"
-    MockSettings.return_value.SUPABASE_URL = "http://dummy"
-    MockSettings.return_value.SUPABASE_ANON_KEY = "dummy"
-    MockSettings.return_value.RATE_LIMIT_RULES = "{}"
-    MockSettings.return_value.CORS_ORIGINS = []
-    
-    from app.main import app
-    from app.api.chat import check_rate_limit, in_memory_rate_limit
+from tests.conftest import ALICE_SESSION, BOB_SESSION
 
-client = TestClient(app)
 
-@pytest.fixture(autouse=True)
-def mock_supabase():
-    with patch("app.api.chat.SupabaseManager") as mock:
-        yield mock
+def _db_stub(**overrides):
+    """Build a SupabaseManager stand-in. Everything is denied unless overridden."""
+    db = AsyncMock()
+    db.owns_session = AsyncMock(return_value=False)
+    db.ensure_session_owned = AsyncMock(return_value=False)
+    db.get_messages_by_session_id = AsyncMock(return_value=[])
+    db.get_chat_sessions = AsyncMock(return_value=[])
+    db.create_chat_session = AsyncMock(return_value=True)
+    db.store_message = AsyncMock(return_value=True)
+    for key, value in overrides.items():
+        setattr(db, key, AsyncMock(return_value=value))
+    return db
 
-def test_create_guest_session(mock_supabase):
-    mock_supabase.create_chat_session = AsyncMock(return_value=True)
+
+# --- Guests ----------------------------------------------------------------
+
+
+def test_guest_gets_a_session_id_without_a_database_row(client):
     response = client.post("/sessions")
     assert response.status_code == 200
     assert "session_id" in response.json()
-    # No auth header -> guest
-    # Verify create_chat_session called with "guest"
-    mock_supabase.create_chat_session.assert_called()
-    args = mock_supabase.create_chat_session.call_args[0]
-    assert args[0] == "guest"
 
-def test_create_user_session(mock_supabase):
-    mock_supabase.create_chat_session = AsyncMock(return_value=True)
-    response = client.post("/sessions", headers={"Authorization": "Bearer token"})
-    assert response.status_code == 200
-    # Verify called with placeholder (or real ID if logic extended)
-    args = mock_supabase.create_chat_session.call_args[0]
-    assert args[0] == "user_placeholder"
 
-def test_get_sessions_guest(mock_supabase):
-    # No auth header should return empty list
+def test_guest_listing_sessions_is_empty(client):
     response = client.get("/sessions")
     assert response.status_code == 200
     assert response.json() == []
-    mock_supabase.get_chat_sessions_for_user.assert_not_called()
 
-def test_get_sessions_user(mock_supabase):
-    mock_sessions = [{"id": "123", "session_name": "Test"}]
-    mock_supabase.get_chat_sessions_for_user = AsyncMock(return_value=mock_sessions)
-    response = client.get("/sessions", headers={"Authorization": "Bearer token"})
+
+def test_guest_reading_messages_is_empty(client):
+    response = client.get(f"/sessions/{ALICE_SESSION}/messages")
     assert response.status_code == 200
-    assert response.json() == mock_sessions
+    assert response.json() == []
 
-def test_rate_limit_function():
-    in_memory_rate_limit.clear()
-    ip = "127.0.0.1"
-    
-    # 10 allowed
-    for _ in range(10):
-        check_rate_limit(ip)
-    
-    # 11th blocked
-    with pytest.raises(HTTPException) as exc:
-        check_rate_limit(ip)
-    assert exc.value.status_code == 429
 
-def test_migrate_sessions(mock_supabase):
-    mock_supabase.migrate_chat_sessions = AsyncMock(return_value=True)
-    payload = {"guest_session_ids": ["sess1", "sess2"]}
-    response = client.post("/sessions/migrate", json=payload, headers={"Authorization": "Bearer token"})
-    assert response.status_code == 200
-    assert response.json()["success"] is True
-    assert response.json()["migrated"] == 2
+# --- Invalid credentials ---------------------------------------------------
 
-def test_migrate_sessions_no_auth(mock_supabase):
-    payload = {"guest_session_ids": ["sess1"]}
-    response = client.post("/sessions/migrate", json=payload)
+
+@pytest.mark.parametrize(
+    "method,path",
+    [
+        ("get", "/sessions"),
+        ("post", "/sessions"),
+        ("get", f"/sessions/{ALICE_SESSION}/messages"),
+    ],
+)
+def test_a_junk_token_is_rejected_rather_than_trusted(client, method, path):
+    """Regression: any non-empty header used to mean 'authenticated'."""
+    response = getattr(client, method)(path, headers={"Authorization": "Bearer nonsense"})
     assert response.status_code == 401
+
+
+# --- Ownership -------------------------------------------------------------
+
+
+def test_reading_another_users_session_returns_404(client, as_user, alice):
+    """The IDOR fix: alice must not be able to read bob's messages by UUID."""
+    as_user(alice)
+    db = _db_stub()  # owns_session False => not hers
+    db.get_messages_by_session_id = AsyncMock(return_value=[{"content": "bob's secret"}])
+
+    with patch("app.api.chat.SupabaseManager.for_user", AsyncMock(return_value=db)):
+        response = client.get(f"/sessions/{BOB_SESSION}/messages")
+
+    assert response.status_code == 404
+    assert "bob's secret" not in response.text
+
+
+def test_reading_your_own_session_returns_its_messages(client, as_user, alice):
+    as_user(alice)
+    db = _db_stub(owns_session=True)
+    db.get_messages_by_session_id = AsyncMock(return_value=[{"content": "hello"}])
+
+    with patch("app.api.chat.SupabaseManager.for_user", AsyncMock(return_value=db)):
+        response = client.get(f"/sessions/{ALICE_SESSION}/messages")
+
+    assert response.status_code == 200
+    assert response.json() == [{"content": "hello"}]
+
+
+def test_messages_endpoint_rejects_a_malformed_session_id(client, as_user, alice):
+    as_user(alice)
+    with patch("app.api.chat.SupabaseManager.for_user", AsyncMock(return_value=_db_stub())):
+        response = client.get("/sessions/not-a-uuid/messages")
+    assert response.status_code == 400
+
+
+def test_posting_to_another_users_session_returns_404(client, as_user, alice):
+    """Writes were unguarded too: any session UUID could be written into."""
+    as_user(alice)
+    db = _db_stub()  # ensure_session_owned False
+
+    with patch("app.api.chat.SupabaseManager.for_user", AsyncMock(return_value=db)):
+        response = client.post(
+            "/chat",
+            json={"user_input": "hi"},
+            headers={"X-Session-ID": BOB_SESSION},
+        )
+
+    assert response.status_code == 404
+    db.store_message.assert_not_awaited()
+
+
+def test_listing_sessions_uses_the_authenticated_user(client, as_user, alice):
+    as_user(alice)
+    db = _db_stub()
+    db.get_chat_sessions = AsyncMock(return_value=[{"id": ALICE_SESSION}])
+
+    with patch("app.api.chat.SupabaseManager.for_user", AsyncMock(return_value=db)) as for_user:
+        response = client.get("/sessions")
+
+    assert response.status_code == 200
+    assert response.json() == [{"id": ALICE_SESSION}]
+    assert for_user.await_args.args[0].id == alice.id
+
+
+# --- Request validation ----------------------------------------------------
+
+
+def test_chat_requires_a_session_header(client):
+    assert client.post("/chat", json={"user_input": "hi"}).status_code == 400
+
+
+def test_chat_rejects_a_malformed_session_header(client):
+    response = client.post(
+        "/chat", json={"user_input": "hi"}, headers={"X-Session-ID": "nope"}
+    )
+    assert response.status_code == 400
+
+
+def test_chat_rejects_empty_input(client):
+    response = client.post(
+        "/chat", json={"user_input": "   "}, headers={"X-Session-ID": ALICE_SESSION}
+    )
+    assert response.status_code == 400
+
+
+def test_scrape_endpoint_requires_an_identifier(client):
+    assert client.post("/scrape_leetcode", json={}).status_code == 400

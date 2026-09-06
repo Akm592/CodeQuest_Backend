@@ -1,14 +1,16 @@
-import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
 from app.llm.gemini_integration import (
     clean_json_response,
-    get_visualization_data,
     get_chat_response,
-    stream_chat_response,
     get_contextual_visualization_data,
+    get_visualization_data,
+    stream_chat_response,
 )
 from app.llm.prompts import VISUALIZATION_PROMPT
-from google.genai import types
+
 
 # Test for clean_json_response
 def test_clean_json_response():
@@ -106,7 +108,7 @@ async def test_get_chat_response_with_history(mock_genai_client):
     assert len(kwargs['history']) == 2
     assert kwargs['history'][0].role == 'user'
     assert kwargs['history'][0].parts[0].text == 'Hello'
-    
+
     mock_chat_session.send_message.assert_any_call(system_prompt)
     mock_chat_session.send_message.assert_any_call(user_query)
     assert result == "Bot response with history"
@@ -120,8 +122,8 @@ async def test_stream_chat_response_success(mock_genai_client):
         yield MagicMock(text="chunk2")
         yield MagicMock(text="chunk3")
 
-    # Set as return_value of the AsyncMock. 
-    # Calling the mock returns a coroutine (because it's AsyncMock child of MagicMock?) 
+    # Set as return_value of the AsyncMock.
+    # Calling the mock returns a coroutine (because it's AsyncMock child of MagicMock?)
     # actually mock_genai_client.aio... is likely a MagicMock unless we specify.
     # Let's forcibly make generate_content_stream an AsyncMock.
     mock_genai_client.aio.models.generate_content_stream = AsyncMock(return_value=mock_iter())
@@ -137,7 +139,7 @@ async def test_stream_chat_response_success(mock_genai_client):
     _, kwargs = mock_genai_client.aio.models.generate_content_stream.call_args
     # Verify contents structure
     contents = kwargs['contents']
-    assert len(contents) == 2 
+    assert len(contents) == 2
     assert contents[0].role == 'user'
     assert contents[0].parts[0].text == system_prompt
     assert contents[1].role == 'user'
@@ -175,7 +177,9 @@ async def test_stream_chat_response_with_history(mock_genai_client):
 async def test_get_contextual_visualization_data_success(mock_genai_client):
     mock_chat_session = AsyncMock()
     mock_genai_client.aio.chats.create.return_value = mock_chat_session
-    mock_chat_session.send_message.return_value.text = '```json\n{\"type\": \"graph\", \"nodes\": [{\"id\": \"A\"}]}\n```'
+    mock_chat_session.send_message.return_value.text = (
+        '```json\n{\"type\": \"graph\", \"nodes\": [{\"id\": \"A\"}]}\n```'
+    )
 
     user_query = "visualize graph"
     chat_history = []
@@ -190,7 +194,10 @@ async def test_get_contextual_visualization_data_success(mock_genai_client):
 
     mock_genai_client.aio.chats.create.assert_called_once()
     # Note the extra newline due to how context_prompt is constructed in the app
-    expected_prompt_part = VISUALIZATION_PROMPT + "\n\nAlgorithm Solution Context:\nDFS algorithm\n\n\nUser Request: visualize graph"
+    expected_prompt_part = (
+        VISUALIZATION_PROMPT
+        + "\n\nAlgorithm Solution Context:\nDFS algorithm\n\n\nUser Request: visualize graph"
+    )
     mock_chat_session.send_message.assert_called_once_with(expected_prompt_part)
     assert result == {"type": "graph", "nodes": [{"id": "A"}]}
 
@@ -217,7 +224,10 @@ async def test_get_contextual_visualization_data_with_chat_history(mock_genai_cl
         "model: Bubble sort is a simple sorting algorithm......\n"
         "user: Show me an example with [5,4,3]...\n"
     )
-    expected_prompt_part = VISUALIZATION_PROMPT + "\n\n" + expected_recent_context + "\n\nUser Request: visualize sorting"
+    expected_prompt_part = (
+        VISUALIZATION_PROMPT + "\n\n" + expected_recent_context
+        + "\n\nUser Request: visualize sorting"
+    )
     # mock_chat_session.send_message.assert_called_once_with(expected_prompt_part)
     mock_chat_session.send_message.assert_called_once()
     actual_prompt = mock_chat_session.send_message.call_args[0][0]

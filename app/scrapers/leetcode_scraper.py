@@ -17,7 +17,7 @@ LEETCODE_ALL_PROBLEMS_URL = "https://leetcode.com/api/problems/all/"
 _problems_cache: Optional[List[Dict[str, Any]]] = None
 
 async def _fetch_all_problems() -> Optional[List[Dict[str, Any]]]:
-    """Fetches and caches the list of all LeetCode problems."""
+    """Fetch and cache the list of all LeetCode problems."""
     global _problems_cache
     if _problems_cache:
         return _problems_cache
@@ -64,14 +64,16 @@ def normalize_text(text: str) -> str:
     return text
 
 async def get_title_slug(identifier: str) -> Optional[str]:
-    """Resolve a LeetCode question identifier (URL, number, title, combined, or pasted) to a title slug.
-    """
+    """Resolve a LeetCode identifier (URL, number, title or pasted text) to a title slug."""
     if not identifier or not isinstance(identifier, str):
         logger.warning("Invalid identifier provided to get_title_slug: must be a non-empty string.")
         return None
 
     normalized_identifier = normalize_text(identifier)
-    logger.info(f"Attempting to resolve identifier: '{identifier[:100]}...' (normalized: '{normalized_identifier[:100]}...')")
+    logger.info(
+        f"Resolving identifier: '{identifier[:100]}...' "
+        f"(normalized: '{normalized_identifier[:100]}...')"
+    )
 
     # 1. Check for URL (more robustly handles query params etc.)
     url_match = re.search(r"leetcode\.com/problems/([^/?#]+)", identifier)
@@ -116,7 +118,8 @@ async def get_title_slug(identifier: str) -> Optional[str]:
             # Use frontend_question_id as it's the displayed number
             if str(stat.get("frontend_question_id")) == potential_number:
                 slug = stat.get("question__title_slug")
-                if not slug: continue # Skip if slug is missing for this problem
+                if not slug:  # Skip if slug is missing for this problem
+                    continue
 
                 # If we also have a title part, verify it loosely matches
                 if potential_title_part:
@@ -127,7 +130,10 @@ async def get_title_slug(identifier: str) -> Optional[str]:
                         matched_slug = slug
                         break # Found best match
                     else:
-                        logger.debug(f"Number {potential_number} matched slug {slug}, but title part '{potential_title_part}' didn't match problem title '{problem_title_norm}'")
+                        logger.debug(
+                            f"Number {potential_number} matched slug {slug}, but title part "
+                            f"'{potential_title_part}' did not match '{problem_title_norm}'"
+                        )
                         # Don't break yet, maybe another problem has same number? (unlikely)
                         # If we don't find a better match, we might fallback to this later.
                         if not matched_slug: # Store first number match as fallback
@@ -158,7 +164,8 @@ async def get_title_slug(identifier: str) -> Optional[str]:
             stat = problem.get("stat", {})
             problem_title_norm = normalize_text(stat.get("question__title", ""))
             slug = stat.get("question__title_slug")
-            if not slug or not problem_title_norm: continue
+            if not slug or not problem_title_norm:
+                continue
 
             if problem_title_norm == search_title:
                 logger.info(f"Matched by exact title: {slug}")
@@ -172,7 +179,8 @@ async def get_title_slug(identifier: str) -> Optional[str]:
                 stat = problem.get("stat", {})
                 problem_title_norm = normalize_text(stat.get("question__title", ""))
                 slug = stat.get("question__title_slug")
-                if not slug or not problem_title_norm: continue
+                if not slug or not problem_title_norm:
+                    continue
 
                 # Check if the actual problem title is a substring of the search title
                 if problem_title_norm and problem_title_norm in search_title:
@@ -185,7 +193,10 @@ async def get_title_slug(identifier: str) -> Optional[str]:
                  candidates.sort(key=lambda x: x['score'], reverse=True)
                  matched_slug = candidates[0]['slug']
                  matched_title = candidates[0]['title']
-                 logger.info(f"Matched by best fuzzy title (title in identifier): {matched_slug} (Matched Title: '{matched_title}')")
+                 logger.info(
+                     f"Matched by best fuzzy title: {matched_slug} "
+                     f"(Matched Title: '{matched_title}')"
+                 )
 
         if matched_slug:
             logger.info(f"Resolution successful based on title matching: {matched_slug}")
@@ -207,7 +218,8 @@ async def get_title_slug(identifier: str) -> Optional[str]:
                 for problem in problems:
                      stat = problem.get("stat", {})
                      slug = stat.get("question__title_slug")
-                     if not slug: continue
+                     if not slug:
+                         continue
 
                      if str(stat.get("frontend_question_id")) == num:
                         problem_title_norm = normalize_text(stat.get("question__title", ""))
@@ -221,7 +233,8 @@ async def get_title_slug(identifier: str) -> Optional[str]:
                      logger.info(f"Resolution successful based on pasted text heuristic: {matched_slug}")
                      return matched_slug # Exit outer loop too
             # Stop checking lines if match found
-            if matched_slug: break
+            if matched_slug:
+                break
 
     if not matched_slug:
         logger.warning(f"Could not resolve identifier to a LeetCode title slug: '{identifier[:100]}...'")
@@ -229,152 +242,9 @@ async def get_title_slug(identifier: str) -> Optional[str]:
     return matched_slug
 
 
-async def fetch_leetcode_question(title_slug: str) -> Optional[str]:
-    """Fetch question details from LeetCode GraphQL API using a title slug.
-    Returns a formatted string with details or None on failure.
-    """
-    logger.info(f"Fetching LeetCode details for title slug: {title_slug}")
-    query = """
-    query getQuestionDetail($titleSlug: String!) {
-      question(titleSlug: $titleSlug) {
-        questionId
-        questionFrontendId
-        title
-        content
-        difficulty
-        topicTags {
-          name
-          slug
-        }
-        codeSnippets { # Optionally fetch code snippets
-            langSlug
-            code
-        }
-      }
-    }
-    """
-    variables = {"titleSlug": title_slug}
-    # Use headers that mimic a browser to reduce chance of being blocked
-    headers = {
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36",
-        "Referer": f"https://leetcode.com/problems/{title_slug}/", # Referer is often checked
-        "Origin": "https://leetcode.com",
-        # You might need 'x-csrftoken' if interacting with logged-in features, but usually not needed for public data
-    }
-
-    try:
-        # Use a reasonable timeout
-        async with httpx.AsyncClient(timeout=20.0) as client:
-            response = await client.post(
-                LEETCODE_GRAPHQL_URL,
-                json={"query": query, "variables": variables},
-                headers=headers
-            )
-            response.raise_for_status() # Check for HTTP errors like 4xx/5xx
-
-        data = response.json()
-
-        # Check for GraphQL specific errors returned in the JSON body
-        if "errors" in data:
-             logger.error(f"GraphQL error fetching '{title_slug}': {data['errors']}")
-             return None
-
-        if not data.get("data"):
-             logger.error(f"GraphQL response missing 'data' field for '{title_slug}'. Response: {data}")
-             return None
-
-        question_data = data.get("data", {}).get("question")
-        if not question_data:
-            logger.warning(f"No question data found for slug '{title_slug}' in GraphQL response data.")
-            # This might happen if the slug is valid but the question is hidden/premium?
-            return None # Treat as not found
-
-        # --- Format the output ---
-        title = question_data.get('title', 'N/A')
-        frontend_id = question_data.get('questionFrontendId', '')
-        difficulty = question_data.get('difficulty', 'N/A')
-
-        # Clean HTML content using BeautifulSoup
-        html_content = question_data.get("content", "")
-        clean_content = "No description available."
-        if html_content:
-            try:
-                soup = BeautifulSoup(html_content, "html.parser")
-                # Extract text, trying to preserve paragraphs and structure slightly better
-                # Replace <p> with newline, <li> with "* ", etc.
-                for br in soup.find_all("br"):
-                    br.replace_with("\n")
-                for p in soup.find_all("p"):
-                    p.append("\n\n")
-                for li in soup.find_all("li"):
-                    li.insert(0, "* ")
-                    li.append("\n")
-                # Remove script/style tags
-                for tag in soup(["script", "style"]):
-                    tag.decompose()
-
-                # Get text, strip extra whitespace but keep meaningful newlines
-                clean_content = soup.get_text(separator=" ").strip()
-                # Consolidate multiple newlines/spaces that might result
-                clean_content = re.sub(r'\s*\n\s*', '\n', clean_content).strip()
-                clean_content = re.sub(r'[ \t]{2,}', ' ', clean_content) # Consolidate spaces
-
-            except Exception as parse_error:
-                logger.warning(f"Error parsing HTML content for {title_slug}: {parse_error}. Falling back to raw content.")
-                clean_content = html_content # Fallback
-
-        # Add topic tags if available
-        tags = [tag['name'] for tag in question_data.get('topicTags', []) if tag and 'name' in tag]
-        tags_str = f"Topics: {', '.join(tags)}\n" if tags else ""
-
-        # Construct the final result string
-        result = (
-            f"ID: {frontend_id}\n"
-            f"Title: {title}\n"
-            f"Difficulty: {difficulty}\n"
-            f"{tags_str}"
-            f"\nContent:\n{clean_content}"
-        )
-        logger.info(f"Successfully fetched and formatted details for: {frontend_id}. {title}")
-        return result
-
-    except httpx.HTTPStatusError as e:
-        # Log specific HTTP errors
-        logger.error(f"HTTP error fetching LeetCode question '{title_slug}': Status {e.response.status_code} - URL: {e.request.url}")
-        try:
-            # Try to log response body for debugging if available and not too large
-            error_body = e.response.text
-            logger.error(f"Response body: {error_body[:500]}{'...' if len(error_body) > 500 else ''}")
-        except Exception:
-            logger.error("Could not read error response body.")
-        return None
-    except httpx.RequestError as e:
-        # Log connection errors, timeouts etc.
-        logger.error(f"Request error fetching LeetCode question '{title_slug}': {e}")
-        return None
-    except Exception as e:
-        # Log any other unexpected errors
-        logger.error(f"Unexpected error fetching or processing LeetCode question '{title_slug}': {e}", exc_info=True)
-        return None
-
-
-async def scrape_leetcode_question(identifier: str) -> Optional[str]:
-    """Scrape a LeetCode question given an identifier (URL, question number, title, combined, or pasted text).
-    Returns a formatted string with the question details, or None if failed.
-    """
-    title_slug = await get_title_slug(identifier)
-    if not title_slug:
-        # get_title_slug already logged the failure reason
-        return None
-
-    return await fetch_leetcode_question(title_slug)
-
-
-
 def extract_examples_from_content(content: str) -> List[Dict[str, Any]]:
     """Extract example inputs and outputs from LeetCode problem content.
+
     Returns a list of examples with input and output data.
     """
     examples = []
@@ -395,20 +265,37 @@ def extract_examples_from_content(content: str) -> List[Dict[str, Any]]:
             "explanation": None
         }
 
-        # Extract Input
-        input_match = re.search(r'Input:\s*(.+?)(?=\n(?:Output|Explanation))', example_content, re.DOTALL)
+        # Extract Input.
+        # The lookaheads must not require a newline: the HTML is flattened with
+        # `soup.get_text(separator=" ")` before it reaches here, so "Input: ...
+        # Output: ..." arrives on one line. Requiring \n meant input and output
+        # were always None in production and only ever parsed in tests that fed
+        # raw HTML.
+        input_match = re.search(
+            r'Input:\s*(.+?)(?=\s*Output\s*:|\s*Explanation\s*:|\Z)',
+            example_content,
+            re.DOTALL | re.IGNORECASE,
+        )
         if input_match:
             input_text = input_match.group(1).strip()
             example_data["input"] = parse_input_data(input_text)
 
         # Extract Output
-        output_match = re.search(r'Output:\s*(.+?)(?=\n(?:Explanation|Example|\Z))', example_content, re.DOTALL)
+        output_match = re.search(
+            r'Output:\s*(.+?)(?=\s*Explanation\s*:|\s*Example\s*\d+\s*:|\Z)',
+            example_content,
+            re.DOTALL | re.IGNORECASE,
+        )
         if output_match:
             output_text = output_match.group(1).strip()
             example_data["output"] = parse_output_data(output_text)
 
         # Extract Explanation
-        explanation_match = re.search(r'Explanation:\s*(.+?)(?=\nExample|\Z)', example_content, re.DOTALL)
+        explanation_match = re.search(
+            r'Explanation:\s*(.+?)(?=\s*Example\s*\d+\s*:|\Z)',
+            example_content,
+            re.DOTALL | re.IGNORECASE,
+        )
         if explanation_match:
             example_data["explanation"] = explanation_match.group(1).strip()
 
@@ -422,9 +309,11 @@ def parse_input_data(input_text: str) -> Dict[str, Any]:
         "raw": input_text,
         "variables": {}
     }
-    # Pattern to capture variable_name = value
-    # It tries to be as broad as possible for the value part
-    pattern = r'(\w+)\s*=\s*(.+?)(?:,\s*\w+\s*=|\Z)'
+    # Capture `variable_name = value`, as broadly as possible for the value.
+    # The trailing group must be a lookahead: as a consuming group it swallowed
+    # the ", next_var =" delimiter, so findall could only ever return the first
+    # variable ("nums = [2,7], target = 9" yielded nums and dropped target).
+    pattern = r'(\w+)\s*=\s*(.+?)(?=,\s*\w+\s*=|\Z)'
     matches = re.findall(pattern, input_text, re.DOTALL)
     for var_name, var_value_raw in matches:
         var_value = var_value_raw.strip()
@@ -472,8 +361,7 @@ def parse_output_data(output_text: str) -> Dict[str, Any]:
     return parsed_output
 
 async def fetch_leetcode_question(title_slug: str) -> Optional[Dict[str, Any]]:
-    """Enhanced version that returns structured data including examples.
-    """
+    """Fetch one question by slug, returning structured data including examples."""
     logger.info(f"Fetching LeetCode details for title slug: {title_slug}")
     query = """
     query getQuestionDetail($titleSlug: String!) {
@@ -498,7 +386,10 @@ async def fetch_leetcode_question(title_slug: str) -> Optional[Dict[str, Any]]:
     headers = {
         "Content-Type": "application/json",
         "Accept": "application/json",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36",
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36"
+        ),
         "Referer": f"https://leetcode.com/problems/{title_slug}/",
         "Origin": "https://leetcode.com",
     }
@@ -564,6 +455,9 @@ async def fetch_leetcode_question(title_slug: str) -> Optional[Dict[str, Any]]:
 
         # Return structured data instead of formatted string
         result = {
+            # The slug is what lets a later turn re-resolve this problem without
+            # relying on server memory surviving between requests.
+            "slug": title_slug,
             "id": frontend_id,
             "title": title,
             "difficulty": difficulty,
@@ -582,13 +476,21 @@ async def fetch_leetcode_question(title_slug: str) -> Optional[Dict[str, Any]]:
         logger.info(f"Successfully fetched details for: {frontend_id}. {title} with {len(examples)} examples")
         return result
 
+    except httpx.HTTPStatusError as e:
+        logger.error(
+            f"HTTP status error fetching '{title_slug}': "
+            f"{e.response.status_code} - {e.request.url}"
+        )
+        return None
+    except httpx.RequestError as e:
+        logger.error(f"HTTP request error fetching '{title_slug}': {e}")
+        return None
     except Exception as e:
         logger.error(f"Error fetching LeetCode question '{title_slug}': {e}", exc_info=True)
         return None
 
 async def scrape_leetcode_question(identifier: str) -> Optional[Dict[str, Any]]:
-    """Enhanced scraper that returns structured data with examples.
-    """
+    """Resolve an identifier to a question and fetch its structured details."""
     title_slug = await get_title_slug(identifier)
     if not title_slug:
         return None

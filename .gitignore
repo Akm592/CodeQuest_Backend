@@ -109,3 +109,8 @@ __pycache__
 .venv
 env/
 venv/
+# Profiling output
+*.prof
+
+# Generated API schema (run generate_openapi.py when you need it)
+openapi.json

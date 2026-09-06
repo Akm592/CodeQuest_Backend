@@ -8,7 +8,7 @@ from google.genai import types
 
 from app.core.config import settings
 from app.core.logger import logger
-from app.llm.prompts import VISUALIZATION_PROMPT , INTENT_CLASSIFICATION_PROMPT
+from app.llm.prompts import INTENT_CLASSIFICATION_PROMPT, VISUALIZATION_PROMPT
 
 client = genai.Client(api_key=settings.GEMINI_API_KEY)
 
@@ -98,8 +98,8 @@ async def get_chat_response(
             history=history
         )
         if system_prompt:
-            # Send system prompt as the first message if needed, or better, include it in config if supported as system instruction.
-            # But adhering to previous logic: send it first.
+            # Sent as the first message rather than as a system instruction,
+            # preserving the original behaviour.
             await chat.send_message(system_prompt)
 
         response = await chat.send_message(user_query)
@@ -131,7 +131,7 @@ async def stream_chat_response(
         contents.append(types.Content(role="user", parts=[types.Part(text=user_query)]))
 
         # Stream response
-        # Using generate_content_stream for one-off generation with context manually constructed, 
+        # Using generate_content_stream for one-off generation with context manually constructed,
         # mirroring the previous logic which passed a list of contents.
         response = await client.aio.models.generate_content_stream(
             model=DEFAULT_MODEL,
@@ -171,7 +171,7 @@ async def get_contextual_visualization_data(
             if recent_context:
                 context_prompt += "\n\nRecent Conversation Context:\n" + "\n".join(recent_context) + "\n"
 
-        
+
         chat = client.aio.chats.create(
             model=DEFAULT_MODEL,
             config=visualization_config,
@@ -193,32 +193,11 @@ async def get_contextual_visualization_data(
         return None
 
 
-# INTENT_CLASSIFICATION_PROMPT = """
-# You are an expert intent classifier for a computer science tutoring chatbot. Your task is to analyze the user's query and classify it into one of the following categories:
-
-# - "visualization": The user wants to see a step-by-step execution of an algorithm, often with specific data. They use words like "visualize", "show steps", "trace", "draw", "animate", or provide an algorithm name along with data like an array or graph.
-# - "cs_tutor": The user wants an explanation of a concept, an algorithm, or a solution to a problem (like a LeetCode question). They use words like "teach me", "explain", "how does...work", "what is", "solve", or ask for complexity analysis.
-# - "general": The query is a general conversation starter, a greeting, or a question not related to a specific CS concept or visualization.
-
-# Analyze the following user query and return ONLY the single-word classification. Do not add any other text, reasoning, or markdown.
-
-# Examples:
-# - Query: "Bubble sort visualization with array [64, 34, 25, 12, 22, 11, 90]" -> visualization
-# - Query: "teach me binary search" -> cs_tutor
-# - Query: "solve leetcode 1. two sum" -> cs_tutor
-# - Query: "Quick sort with pivot selection on [3, 6, 8, 10, 1, 2, 1]" -> visualization
-# - Query: "what is the time complexity of merge sort?" -> cs_tutor
-# - Query: "hi how are you" -> general
-# - Query: "BFS traversal starting from node A in graph with edges [(A,B), (A,C), (B,D), (C,D)]" -> visualization
-
-# User Query: "{user_query}"
-# """
-
 async def classify_intent_with_llm(user_query: str) -> str:
-    """Uses the LLM to classify the user's intent with in-memory caching."""
+    """Use the LLM to classify the user's intent with in-memory caching."""
     # Normalize query for better cache hits
     normalized_query = user_query.strip().lower()
-    
+
     # Check cache first
     if normalized_query in _intent_cache:
         logger.info(f"Cache hit for intent: '{normalized_query[:30]}...' -> {_intent_cache[normalized_query]}")
@@ -239,13 +218,13 @@ async def classify_intent_with_llm(user_query: str) -> str:
 
         if intent in ["visualization", "cs_tutor", "general"]:
             logger.info(f"LLM classified intent for '{user_query[:60]}...' as: {intent} (took {duration:.2f}s)")
-            
+
             # Update cache (simple FIFO-ish pruning if it gets too big)
             if len(_intent_cache) >= MAX_CACHE_SIZE:
                 # Remove a random key or first key if needed, here just clearing oldest entry
                 oldest_key = next(iter(_intent_cache))
                 del _intent_cache[oldest_key]
-            
+
             _intent_cache[normalized_query] = intent
             return intent
         else:

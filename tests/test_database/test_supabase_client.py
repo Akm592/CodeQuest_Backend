@@ -1,292 +1,240 @@
+"""SupabaseManager.
+
+Every query is scoped to the owning user. The database enforces this too, via
+the RLS policies in supabase/migrations, but the explicit filters keep the
+intent visible in the code and use the indexes.
+"""
+
+from unittest.mock import AsyncMock, MagicMock
+
 import pytest
-from unittest.mock import MagicMock, patch
+
 from app.database.supabase_client import SupabaseManager
-from supabase import Client
-import uuid
 
-@pytest.fixture(autouse=True)
-def mock_supabase_client():
-    with patch('app.database.supabase_client.create_client') as mock_create_client:
-        mock_client_instance = MagicMock(spec=Client)
-        mock_create_client.return_value = mock_client_instance
-        SupabaseManager._client = None  # Ensure client is re-initialized for each test
-        yield mock_client_instance
+USER_ID = "11111111-1111-1111-1111-111111111111"
+SESSION_ID = "aaaaaaaa-0000-0000-0000-000000000001"
+OTHER_SESSION = "bbbbbbbb-0000-0000-0000-000000000002"
 
-def test_get_client_initialization(mock_supabase_client):
-    client = SupabaseManager.get_client()
-    assert client is mock_supabase_client
 
-def test_get_client_returns_existing_client(mock_supabase_client):
-    first_client = SupabaseManager.get_client()
-    second_client = SupabaseManager.get_client()
-    assert first_client is second_client
-    assert first_client is mock_supabase_client
+class FakeQuery:
+    """Records the filters applied, then returns a canned result."""
 
-def test_get_client_raises_error_on_failure():
-    with patch('app.database.supabase_client.create_client', side_effect=Exception("Supabase connection error")):
-        SupabaseManager._client = None # Reset client for this test
-        with pytest.raises(Exception, match="Supabase connection error"):
-            SupabaseManager.get_client()
+    def __init__(self, result=None, raises=None):
+        self._result = result if result is not None else []
+        self._raises = raises
+        self.filters = {}
+        self.payload = None
+        self.table_name = None
 
-@pytest.mark.asyncio
-async def test_create_chat_session_success(mock_supabase_client):
-    mock_execute = MagicMock()
-    mock_execute.return_value.data = [{}]
-    mock_supabase_client.table.return_value.insert.return_value.execute.return_value = mock_execute.return_value
+    # Chainable builder methods
+    def select(self, *_args, **_kwargs):
+        return self
 
-    user_id = "test_user"
-    session_id = str(uuid.uuid4())
-    session_name = "Test Chat"
+    def insert(self, payload):
+        self.payload = payload
+        return self
 
-    result = await SupabaseManager.create_chat_session(user_id, session_id, session_name)
+    def update(self, payload):
+        self.payload = payload
+        return self
 
-    mock_supabase_client.table.assert_called_once_with("chat_sessions")
-    mock_supabase_client.table.return_value.insert.assert_called_once_with({
-        "session_id": session_id,
-        "user_id": user_id,
-        "session_name": session_name,
-    })
-    mock_supabase_client.table.return_value.insert.return_value.execute.assert_called_once()
-    assert result is True
+    def eq(self, column, value):
+        self.filters[column] = value
+        return self
 
-@pytest.mark.asyncio
-async def test_create_chat_session_failure(mock_supabase_client):
-    mock_supabase_client.table.return_value.insert.return_value.execute.side_effect = Exception("DB error")
+    def order(self, *_args, **_kwargs):
+        return self
 
-    user_id = "test_user"
-    session_id = str(uuid.uuid4())
-    session_name = "Test Chat"
+    def limit(self, *_args, **_kwargs):
+        return self
 
-    result = await SupabaseManager.create_chat_session(user_id, session_id, session_name)
+    async def execute(self):
+        if self._raises:
+            raise self._raises
+        return MagicMock(data=self._result)
 
-    assert result is False
 
-@pytest.mark.asyncio
-async def test_create_chat_session_invalid_uuid(mock_supabase_client):
-    user_id = "test_user"
-    session_id = "invalid-uuid"
-    session_name = "Test Chat"
+def make_manager(result=None, raises=None):
+    query = FakeQuery(result=result, raises=raises)
+    client = MagicMock()
 
-    result = await SupabaseManager.create_chat_session(user_id, session_id, session_name)
+    def table(name):
+        query.table_name = name
+        return query
 
-    assert result is False
-    mock_supabase_client.table.assert_not_called() # Should not attempt DB call with invalid UUID
+    client.table = table
+    return SupabaseManager(client, USER_ID), query
 
-@pytest.mark.asyncio
-async def test_get_session_by_id_found(mock_supabase_client):
-    session_id = str(uuid.uuid4())
-    expected_session = {"session_id": session_id, "user_id": "user123", "session_name": "My Chat"}
-    
-    mock_execute = MagicMock()
-    mock_execute.return_value.data = [expected_session]
-    mock_supabase_client.table.return_value.select.return_value.eq.return_value.limit.return_value.execute.return_value = mock_execute.return_value
 
-    result = await SupabaseManager.get_session_by_id(session_id)
+# --- Reads -----------------------------------------------------------------
 
-    mock_supabase_client.table.assert_called_once_with("chat_sessions")
-    mock_supabase_client.table.return_value.select.assert_called_once_with("*")
-    mock_supabase_client.table.return_value.select.return_value.eq.assert_called_once_with("session_id", session_id)
-    mock_supabase_client.table.return_value.select.return_value.eq.return_value.limit.assert_called_once_with(1)
-    assert result == expected_session
 
-@pytest.mark.asyncio
-async def test_get_session_by_id_not_found(mock_supabase_client):
-    session_id = str(uuid.uuid4())
-    
-    mock_execute = MagicMock()
-    mock_execute.return_value.data = []
-    mock_supabase_client.table.return_value.select.return_value.eq.return_value.limit.return_value.execute.return_value = mock_execute.return_value
+async def test_get_session_by_id_filters_on_both_id_and_owner():
+    manager, query = make_manager(result=[{"id": SESSION_ID}])
+    session = await manager.get_session_by_id(SESSION_ID)
 
-    result = await SupabaseManager.get_session_by_id(session_id)
+    assert session == {"id": SESSION_ID}
+    assert query.table_name == "chat_sessions"
+    assert query.filters == {"id": SESSION_ID, "user_id": USER_ID}
 
-    assert result is None
 
-@pytest.mark.asyncio
-async def test_get_session_by_id_invalid_uuid(mock_supabase_client):
-    session_id = "invalid-uuid"
-    
-    result = await SupabaseManager.get_session_by_id(session_id)
+async def test_get_session_by_id_returns_none_when_not_yours():
+    manager, _ = make_manager(result=[])
+    assert await manager.get_session_by_id(OTHER_SESSION) is None
 
-    assert result is None
-    mock_supabase_client.table.assert_not_called()
 
-@pytest.mark.asyncio
-async def test_get_chat_sessions_for_user_success(mock_supabase_client):
-    user_id = "user123"
-    expected_sessions = [{"session_id": str(uuid.uuid4()), "session_name": "Chat 1"}, {"session_id": str(uuid.uuid4()), "session_name": "Chat 2"}]
-    
-    mock_execute = MagicMock()
-    mock_execute.return_value.data = expected_sessions
-    mock_supabase_client.table.return_value.select.return_value.eq.return_value.order.return_value.execute.return_value = mock_execute.return_value
+@pytest.mark.parametrize("bad", ["not-a-uuid", "", "12345"])
+async def test_get_session_by_id_rejects_malformed_ids(bad):
+    manager, _ = make_manager(result=[{"id": SESSION_ID}])
+    assert await manager.get_session_by_id(bad) is None
 
-    result = await SupabaseManager.get_chat_sessions_for_user(user_id)
 
-    mock_supabase_client.table.assert_called_once_with("chat_sessions")
-    mock_supabase_client.table.return_value.select.assert_called_once_with("*")
-    mock_supabase_client.table.return_value.select.return_value.eq.assert_called_once_with("user_id", user_id)
-    mock_supabase_client.table.return_value.select.return_value.eq.return_value.order.assert_called_once_with("created_at", desc=True)
-    assert result == expected_sessions
+async def test_get_session_by_id_survives_a_database_error():
+    manager, _ = make_manager(raises=Exception("connection reset"))
+    assert await manager.get_session_by_id(SESSION_ID) is None
 
-@pytest.mark.asyncio
-async def test_get_chat_sessions_for_user_failure(mock_supabase_client):
-    user_id = "user123"
-    
-    mock_execute = MagicMock()
-    mock_execute.return_value.data = None # Simulate DB error
-    mock_supabase_client.table.return_value.select.return_value.eq.return_value.order.return_value.execute.return_value = mock_execute.return_value
 
-    result = await SupabaseManager.get_chat_sessions_for_user(user_id)
+async def test_owns_session_reflects_the_lookup():
+    manager, _ = make_manager(result=[{"id": SESSION_ID}])
+    assert await manager.owns_session(SESSION_ID) is True
 
-    assert result is None
+    manager, _ = make_manager(result=[])
+    assert await manager.owns_session(SESSION_ID) is False
 
-@pytest.mark.asyncio
-async def test_get_messages_by_session_id_success(mock_supabase_client):
-    session_id = str(uuid.uuid4())
-    expected_messages = [{"id": 1, "content": "Hello"}, {"id": 2, "content": "Hi"}]
-    
-    mock_execute = MagicMock()
-    mock_execute.return_value.data = expected_messages
-    mock_supabase_client.table.return_value.select.return_value.eq.return_value.order.return_value.execute.return_value = mock_execute.return_value
 
-    result = await SupabaseManager.get_messages_by_session_id(session_id)
+async def test_get_chat_sessions_filters_by_owner():
+    manager, query = make_manager(result=[{"id": SESSION_ID}])
+    sessions = await manager.get_chat_sessions()
 
-    mock_supabase_client.table.assert_called_once_with("messages")
-    mock_supabase_client.table.return_value.select.assert_called_once_with("*")
-    mock_supabase_client.table.return_value.select.return_value.eq.assert_called_once_with("session_id", session_id)
-    mock_supabase_client.table.return_value.select.return_value.eq.return_value.order.assert_called_once_with("created_at", desc=False)
-    assert result == expected_messages
+    assert sessions == [{"id": SESSION_ID}]
+    assert query.filters == {"user_id": USER_ID}
 
-@pytest.mark.asyncio
-async def test_get_messages_by_session_id_not_found(mock_supabase_client):
-    session_id = str(uuid.uuid4())
-    
-    mock_execute = MagicMock()
-    mock_execute.return_value.data = []
-    mock_supabase_client.table.return_value.select.return_value.eq.return_value.order.return_value.execute.return_value = mock_execute.return_value
 
-    result = await SupabaseManager.get_messages_by_session_id(session_id)
+async def test_get_chat_sessions_returns_none_on_error():
+    manager, _ = make_manager(raises=Exception("boom"))
+    assert await manager.get_chat_sessions() is None
 
-    assert result == []
 
-@pytest.mark.asyncio
-async def test_get_messages_by_session_id_invalid_uuid(mock_supabase_client):
-    session_id = "invalid-uuid"
-    
-    result = await SupabaseManager.get_messages_by_session_id(session_id)
+async def test_get_messages_filters_by_session():
+    manager, query = make_manager(result=[{"content": "hi"}])
+    messages = await manager.get_messages_by_session_id(SESSION_ID)
 
-    assert result is None
-    mock_supabase_client.table.assert_not_called()
+    assert messages == [{"content": "hi"}]
+    assert query.table_name == "messages"
+    assert query.filters == {"session_id": SESSION_ID}
 
-@pytest.mark.asyncio
-async def test_update_chat_session_name_success(mock_supabase_client):
-    session_id = str(uuid.uuid4())
-    new_name = "Updated Chat Name"
-    
-    mock_execute = MagicMock()
-    mock_execute.return_value.data = [{}]
-    mock_supabase_client.table.return_value.update.return_value.eq.return_value.execute.return_value = mock_execute.return_value
 
-    result = await SupabaseManager.update_chat_session_name(session_id, new_name)
+async def test_get_messages_rejects_a_malformed_session_id():
+    manager, _ = make_manager(result=[{"content": "hi"}])
+    assert await manager.get_messages_by_session_id("nope") is None
 
-    mock_supabase_client.table.assert_called_once_with("chat_sessions")
-    mock_supabase_client.table.return_value.update.assert_called_once_with({"session_name": new_name})
-    mock_supabase_client.table.return_value.update.return_value.eq.assert_called_once_with("session_id", session_id)
-    assert result is True
 
-@pytest.mark.asyncio
-async def test_update_chat_session_name_failure(mock_supabase_client):
-    session_id = str(uuid.uuid4())
-    new_name = "Updated Chat Name"
-    
-    mock_supabase_client.table.return_value.update.return_value.eq.return_value.execute.side_effect = Exception("Update error")
+# --- Writes ----------------------------------------------------------------
 
-    result = await SupabaseManager.update_chat_session_name(session_id, new_name)
 
-    assert result is False
+async def test_create_chat_session_writes_the_owner_and_the_id_column():
+    manager, query = make_manager()
+    assert await manager.create_chat_session(SESSION_ID, session_name="Chat") is True
 
-@pytest.mark.asyncio
-async def test_update_chat_session_name_invalid_uuid(mock_supabase_client):
-    session_id = "invalid-uuid"
-    new_name = "Updated Chat Name"
-    
-    result = await SupabaseManager.update_chat_session_name(session_id, new_name)
-
-    assert result is False
-    mock_supabase_client.table.assert_not_called()
-
-@pytest.mark.asyncio
-async def test_store_message_success(mock_supabase_client):
-    session_id = str(uuid.uuid4())
-    message_data = {
-        "session_id": session_id,
-        "sender_type": "user",
-        "content": "Hello, bot!",
-        "intent": "general",
-        "visualization_data": None,
-        "parent_message_id": None,
-        "metadata": {"from_frontend": True},
+    # The column is `id`, not `session_id` — the old tests asserted otherwise.
+    assert query.payload == {
+        "id": SESSION_ID,
+        "session_name": "Chat",
+        "user_id": USER_ID,
     }
-    
-    mock_execute = MagicMock()
-    mock_execute.return_value.data = [{}]
-    mock_supabase_client.table.return_value.insert.return_value.execute.return_value = mock_execute.return_value
 
-    result = await SupabaseManager.store_message(**message_data)
 
-    mock_supabase_client.table.assert_called_once_with("messages")
-    mock_supabase_client.table.return_value.insert.assert_called_once_with(message_data)
-    assert result is True
+async def test_create_chat_session_rejects_a_malformed_id():
+    manager, _ = make_manager()
+    assert await manager.create_chat_session("not-a-uuid") is False
 
-@pytest.mark.asyncio
-async def test_store_message_failure(mock_supabase_client):
-    session_id = str(uuid.uuid4())
-    message_data = {
-        "session_id": session_id,
-        "sender_type": "user",
-        "content": "Hello, bot!",
-        "intent": "general",
-        "visualization_data": None,
-        "parent_message_id": None,
-        "metadata": {"from_frontend": True},
-    }
-    
-    mock_supabase_client.table.return_value.insert.return_value.execute.side_effect = Exception("Store error")
 
-    result = await SupabaseManager.store_message(**message_data)
+async def test_create_chat_session_reports_failure():
+    manager, _ = make_manager(raises=Exception("insert failed"))
+    assert await manager.create_chat_session(SESSION_ID) is False
 
+
+async def test_ensure_session_owned_accepts_an_existing_session():
+    manager, _ = make_manager(result=[{"id": SESSION_ID}])
+    assert await manager.ensure_session_owned(SESSION_ID) is True
+
+
+async def test_ensure_session_owned_creates_a_missing_session():
+    manager, query = make_manager(result=[])
+    assert await manager.ensure_session_owned(SESSION_ID, session_name="First words") is True
+    assert query.payload["user_id"] == USER_ID
+    assert query.payload["session_name"] == "First words"
+
+
+async def test_ensure_session_owned_rejects_a_malformed_id():
+    manager, _ = make_manager()
+    assert await manager.ensure_session_owned("bad") is False
+
+
+async def test_update_session_name_is_scoped_to_the_owner():
+    manager, query = make_manager()
+    assert await manager.update_chat_session_name(SESSION_ID, "Renamed") is True
+    assert query.payload == {"session_name": "Renamed"}
+    assert query.filters == {"id": SESSION_ID, "user_id": USER_ID}
+
+
+async def test_store_message_builds_the_expected_row():
+    manager, query = make_manager()
+    ok = await manager.store_message(
+        session_id=SESSION_ID,
+        sender_type="bot",
+        content="hello",
+        intent="general",
+        metadata={"response_type": "LLM_general"},
+    )
+
+    assert ok is True
+    assert query.table_name == "messages"
+    assert query.payload["session_id"] == SESSION_ID
+    assert query.payload["sender_type"] == "bot"
+    assert query.payload["content"] == "hello"
+    assert query.payload["intent"] == "general"
+    assert query.payload["metadata"] == {"response_type": "LLM_general"}
+    assert query.payload["parent_message_id"] is None
+
+
+async def test_store_message_defaults_metadata_to_an_object():
+    manager, query = make_manager()
+    await manager.store_message(session_id=SESSION_ID, sender_type="user", content="hi")
+    assert query.payload["metadata"] == {}
+
+
+async def test_store_message_drops_a_malformed_parent_id():
+    manager, query = make_manager()
+    await manager.store_message(
+        session_id=SESSION_ID, sender_type="user", content="hi", parent_message_id="nope"
+    )
+    assert query.payload["parent_message_id"] is None
+
+
+async def test_store_message_rejects_a_malformed_session_id():
+    manager, _ = make_manager()
+    assert await manager.store_message(session_id="bad", sender_type="user", content="x") is False
+
+
+async def test_store_message_reports_failure():
+    manager, _ = make_manager(raises=Exception("rls denied"))
+    result = await manager.store_message(
+        session_id=SESSION_ID, sender_type="user", content="x"
+    )
     assert result is False
 
-@pytest.mark.asyncio
-async def test_store_message_invalid_session_uuid(mock_supabase_client):
-    message_data = {
-        "session_id": "invalid-uuid",
-        "sender_type": "user",
-        "content": "Hello, bot!",
-        "intent": "general",
-        "visualization_data": None,
-        "parent_message_id": None,
-        "metadata": {"from_frontend": True},
-    }
-    
-    result = await SupabaseManager.store_message(**message_data)
 
-    assert result is False
-    mock_supabase_client.table.assert_not_called()
+async def test_for_user_builds_a_manager_scoped_to_that_user(monkeypatch):
+    from app.core.auth import AuthenticatedUser
+    from app.database import supabase_client
 
-@pytest.mark.asyncio
-async def test_store_message_invalid_parent_message_uuid(mock_supabase_client):
-    session_id = str(uuid.uuid4())
-    message_data = {
-        "session_id": session_id,
-        "sender_type": "user",
-        "content": "Hello, bot!",
-        "intent": "general",
-        "visualization_data": None,
-        "parent_message_id": "invalid-parent-uuid",
-        "metadata": {"from_frontend": True},
-    }
-    
-    result = await SupabaseManager.store_message(**message_data)
+    fake_client = MagicMock()
+    monkeypatch.setattr(
+        supabase_client, "get_user_client", AsyncMock(return_value=fake_client)
+    )
 
-    assert result is False
-    mock_supabase_client.table.assert_not_called()
+    user = AuthenticatedUser(id=USER_ID, email="a@b.c", access_token="tok")
+    manager = await SupabaseManager.for_user(user)
+    assert manager._user_id == USER_ID
+    supabase_client.get_user_client.assert_awaited_once_with("tok")

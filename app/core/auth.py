@@ -15,14 +15,17 @@ The cost is one network round trip per token, which the short-lived cache below
 absorbs for the rest of a conversation.
 """
 
+import asyncio
 import hashlib
 import time
 import uuid
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
+import httpx
 from fastapi import HTTPException, Request
 from supabase import AsyncClient, acreate_client
+from supabase_auth.errors import AuthRetryableError
 
 from app.core.config import settings
 from app.core.logger import logger
@@ -32,6 +35,19 @@ from app.core.logger import logger
 # enough that a burst of requests in one conversation costs a single round trip.
 _CACHE_TTL_SECONDS = 60
 _CACHE_MAX_ENTRIES = 256
+
+# A hanging auth service must not tie up the single free-tier worker.
+_VERIFY_TIMEOUT_SECONDS = 8
+
+# Exceptions that mean "Supabase is unreachable or broken", as opposed to
+# "this token is not valid". supabase-auth raises AuthRetryableError for
+# 502/503/504/520-530 and for transport failures; raw httpx errors can still
+# escape, since its base API only wraps HTTPStatusError and RuntimeError.
+_UNAVAILABLE_ERRORS = (
+    AuthRetryableError,
+    httpx.TransportError,
+    asyncio.TimeoutError,
+)
 
 # token digest -> (expires_at, user)
 _verify_cache: Dict[str, Tuple[float, "AuthenticatedUser"]] = {}
@@ -101,15 +117,31 @@ def extract_bearer_token(request: Request) -> Optional[str]:
 
 
 async def verify_token(token: str) -> AuthenticatedUser:
-    """Verify a Supabase access token. Raises HTTPException on failure."""
+    """Verify a Supabase access token. Raises HTTPException on failure.
+
+    A 401 and a 503 mean very different things to the caller, and conflating them
+    is what turns a brief Supabase outage into a refresh storm: the client reads
+    401 as "your credentials are bad", discards or refreshes its session, and
+    retries against a service that is simply down. So an unreachable auth service
+    is reported as 503 and only an actual rejection as 401.
+    """
     cached = _cache_get(token)
     if cached is not None:
         return cached
 
     try:
         client = await _get_auth_client()
-        response = await client.auth.get_user(token)
-    except Exception as exc:  # network, or Supabase rejecting the token
+        response = await asyncio.wait_for(
+            client.auth.get_user(token), timeout=_VERIFY_TIMEOUT_SECONDS
+        )
+    except _UNAVAILABLE_ERRORS as exc:
+        logger.warning(f"Supabase auth is unreachable; cannot verify tokens: {exc}")
+        raise HTTPException(
+            status_code=503,
+            detail="Authentication is temporarily unavailable. Please try again shortly.",
+            headers={"Retry-After": "30"},
+        ) from exc
+    except Exception as exc:  # Supabase reachable and rejecting the token
         logger.info(f"Token verification failed: {exc}")
         raise HTTPException(status_code=401, detail="Invalid or expired credentials") from exc
 

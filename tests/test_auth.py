@@ -4,6 +4,7 @@ The behaviour under test is the one that was broken: the backend used to treat
 *any* non-empty Authorization header as proof of a signed-in user.
 """
 
+import asyncio
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -95,3 +96,68 @@ def test_cache_never_stores_the_raw_token():
     user = AuthenticatedUser(id="11111111-1111-1111-1111-111111111111", email=None, access_token="s3cret")
     auth_module._cache_put("s3cret", user)
     assert "s3cret" not in auth_module._verify_cache
+
+
+# --- Availability vs. rejection -------------------------------------------
+#
+# Conflating these is what turns a brief Supabase outage into a refresh storm:
+# the client reads 401 as "your credentials are bad" and starts retrying against
+# a service that is simply down.
+
+
+async def _verify_raising(exc):
+    """Run verify_token with get_user raising ``exc``; return the HTTPException."""
+    auth_module.reset_auth_cache()
+    fake_client = AsyncMock()
+    fake_client.auth.get_user = AsyncMock(side_effect=exc)
+    with patch.object(auth_module, "_get_auth_client", AsyncMock(return_value=fake_client)):
+        with pytest.raises(HTTPException) as caught:
+            await verify_token("some-token")
+    return caught.value
+
+
+async def test_a_gateway_error_is_reported_as_unavailable():
+    """AuthRetryableError covers Supabase's 502/503/504 — the paused-project case."""
+    from supabase_auth.errors import AuthRetryableError
+
+    error = await _verify_raising(AuthRetryableError("Bad Gateway", 502))
+    assert error.status_code == 503
+    assert error.headers.get("Retry-After")
+
+
+async def test_a_connection_failure_is_reported_as_unavailable():
+    import httpx
+
+    error = await _verify_raising(httpx.ConnectError("name resolution failed"))
+    assert error.status_code == 503
+
+
+async def test_a_timeout_is_reported_as_unavailable():
+    import asyncio
+
+    error = await _verify_raising(asyncio.TimeoutError())
+    assert error.status_code == 503
+
+
+async def test_a_rejected_token_is_still_401():
+    """A reachable Supabase saying no must not be mistaken for an outage."""
+    from supabase_auth.errors import AuthApiError
+
+    error = await _verify_raising(AuthApiError("invalid claim", 401, "bad_jwt"))
+    assert error.status_code == 401
+
+
+async def test_a_hanging_auth_service_does_not_block_forever(monkeypatch):
+    """Without the timeout a stalled auth service occupies the worker."""
+    monkeypatch.setattr(auth_module, "_VERIFY_TIMEOUT_SECONDS", 0.05)
+    auth_module.reset_auth_cache()
+
+    async def never_returns(_token):
+        await asyncio.sleep(30)
+
+    fake_client = AsyncMock()
+    fake_client.auth.get_user = never_returns
+    with patch.object(auth_module, "_get_auth_client", AsyncMock(return_value=fake_client)):
+        with pytest.raises(HTTPException) as caught:
+            await verify_token("slow-token")
+    assert caught.value.status_code == 503

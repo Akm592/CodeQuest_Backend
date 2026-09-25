@@ -45,18 +45,55 @@ def test_guest_reading_messages_is_empty(client):
 # --- Invalid credentials ---------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    "method,path",
-    [
-        ("get", "/sessions"),
-        ("post", "/sessions"),
-        ("get", f"/sessions/{ALICE_SESSION}/messages"),
-    ],
-)
+ENDPOINTS = [
+    ("get", "/sessions"),
+    ("post", "/sessions"),
+    ("get", f"/sessions/{ALICE_SESSION}/messages"),
+]
+
+
+def _auth_raising(exc):
+    """Patch the Supabase auth client so get_user raises ``exc``."""
+    from app.core import auth as auth_module
+
+    auth_module.reset_auth_cache()
+    fake_client = AsyncMock()
+    fake_client.auth.get_user = AsyncMock(side_effect=exc)
+    return patch.object(auth_module, "_get_auth_client", AsyncMock(return_value=fake_client))
+
+
+@pytest.mark.parametrize("method,path", ENDPOINTS)
 def test_a_junk_token_is_rejected_rather_than_trusted(client, method, path):
     """Regression: any non-empty header used to mean 'authenticated'."""
-    response = getattr(client, method)(path, headers={"Authorization": "Bearer nonsense"})
+    from supabase_auth.errors import AuthApiError
+
+    with _auth_raising(AuthApiError("invalid claim", 401, "bad_jwt")):
+        response = getattr(client, method)(path, headers={"Authorization": "Bearer nonsense"})
     assert response.status_code == 401
+
+
+@pytest.mark.parametrize("method,path", ENDPOINTS)
+def test_an_auth_outage_is_503_not_401(client, method, path):
+    """A paused Supabase project must not read as "your credentials are bad".
+
+    Returning 401 here is what sent the browser into a refresh storm against an
+    endpoint that was simply returning 502.
+    """
+    from supabase_auth.errors import AuthRetryableError
+
+    with _auth_raising(AuthRetryableError("Bad Gateway", 502)):
+        response = getattr(client, method)(path, headers={"Authorization": "Bearer real-token"})
+    assert response.status_code == 503
+    assert response.headers.get("Retry-After")
+
+
+def test_guests_are_unaffected_by_an_auth_outage(client):
+    """Guests present no token, so they never reach verification at all."""
+    from supabase_auth.errors import AuthRetryableError
+
+    with _auth_raising(AuthRetryableError("Bad Gateway", 502)):
+        assert client.get("/sessions").status_code == 200
+        assert client.post("/sessions").status_code == 200
 
 
 # --- Ownership -------------------------------------------------------------

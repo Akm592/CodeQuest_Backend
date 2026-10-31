@@ -1,87 +1,7 @@
-"""Validation of the visualization payloads the model produces.
+"""Prompt construction and language handling for the LeetCode flow."""
 
-Nothing used to check these beyond the presence of a "visualizationType" key, so
-an incomplete payload reached the p5 renderer and drew an empty canvas — which
-reads to a user as a broken product rather than a failed request.
-"""
-
-from app.api.chat import _examples_text, _extract_visualization, _problem_text, detect_language
-from app.schemas.chat_schemas import ChatRequest, validate_visualization
-
-
-def _sorting_payload(**overrides):
-    payload = {
-        "visualizationType": "sorting",
-        "algorithm": "bubble",
-        "array": [3, 1, 2],
-        "steps": [{"array": [3, 1, 2], "message": "start"}],
-    }
-    payload.update(overrides)
-    return payload
-
-
-def test_a_complete_payload_is_accepted():
-    assert validate_visualization(_sorting_payload()) is not None
-
-
-def test_a_payload_missing_its_data_is_rejected():
-    payload = _sorting_payload()
-    del payload["array"]
-    assert validate_visualization(payload) is None
-
-
-def test_a_payload_with_no_steps_is_rejected():
-    assert validate_visualization(_sorting_payload(steps=[])) is None
-
-
-def test_an_unknown_type_is_rejected():
-    assert validate_visualization(_sorting_payload(visualizationType="hologram")) is None
-
-
-def test_the_type_is_normalised():
-    result = validate_visualization(_sorting_payload(visualizationType="  Sorting  "))
-    assert result["visualizationType"] == "sorting"
-
-
-def test_table_is_supported_even_though_the_prompt_omits_it():
-    payload = {"visualizationType": "table", "steps": [{"message": "row"}]}
-    assert validate_visualization(payload) is not None
-
-
-def test_non_dict_input_is_rejected():
-    assert validate_visualization(None) is None
-    assert validate_visualization("nope") is None
-    assert validate_visualization([1, 2, 3]) is None
-
-
-def test_steps_are_capped():
-    payload = _sorting_payload(steps=[{"message": str(i)} for i in range(500)])
-    result = validate_visualization(payload)
-    assert result is not None
-    assert len(result["steps"]) <= 60
-
-
-# --- Extraction from model output -----------------------------------------
-
-
-def test_a_fenced_json_block_is_extracted():
-    text = 'Here you go.\n```json\n{"visualizationType":"table","steps":[{"message":"a"}]}\n```'
-    assert _extract_visualization(text) is not None
-
-
-def test_an_invalid_payload_in_a_fence_yields_nothing():
-    """Falling back to text-only beats emitting a frame that renders blank."""
-    text = '```json\n{"visualizationType":"sorting"}\n```'
-    assert _extract_visualization(text) is None
-
-
-def test_malformed_json_yields_nothing():
-    assert _extract_visualization("```json\n{not json\n```") is None
-
-
-def test_plain_prose_yields_nothing():
-    assert _extract_visualization("Just an explanation, no data.") is None
-
+from app.api.chat import _examples_text, _problem_text, _solution_prompt, detect_language
+from app.schemas.chat_schemas import ChatRequest
 
 # --- Prompt construction ---------------------------------------------------
 
@@ -111,6 +31,17 @@ def test_examples_are_rendered_into_the_prompt():
     text = _examples_text(scraped)
     assert "Example 1" in text
     assert "nums = [2,7], target = 9" in text
+
+
+def test_the_solution_prompt_does_not_ask_for_json():
+    """Asking for a JSON block in the answer leaked raw JSON into the chat.
+
+    Visualizations are now generated separately, against a schema, when the
+    user clicks a suggestion.
+    """
+    prompt = _solution_prompt({"formatted_content": "Two Sum"}, "python")
+    assert "json" not in prompt.lower()
+    assert "**python**" in prompt
 
 
 def test_no_examples_produces_nothing():

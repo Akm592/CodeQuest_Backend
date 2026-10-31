@@ -1,30 +1,31 @@
-import json
-import re
 import time
-from typing import Any, AsyncGenerator, Dict, List, Optional
+from typing import AsyncGenerator, Dict, List, Optional
 
 from google import genai
 from google.genai import types
+from pydantic import ValidationError
 
 from app.core.config import settings
 from app.core.logger import logger
-from app.llm.prompts import INTENT_CLASSIFICATION_PROMPT, VISUALIZATION_PROMPT
+from app.llm.prompts import INTENT_CLASSIFICATION_PROMPT, SCENE_PROMPT, SUGGESTION_PROMPT
+from app.schemas.visualization_schemas import (
+    Scene,
+    Suggestion,
+    SuggestionList,
+    TraceRequest,
+)
 
 client = genai.Client(api_key=settings.GEMINI_API_KEY)
 
 # Default model to use - configurable via GEMINI_MODEL env var
 DEFAULT_MODEL = settings.GEMINI_MODEL
 
-# Generation configurations
-visualization_config = types.GenerateContentConfig(
-    temperature=0.7,
-    top_p=0.95,
-    top_k=40,
-    max_output_tokens=8192,
-    response_mime_type="application/json",
-)
 
-chat_config = types.GenerateContentConfig(
+class GenerationError(Exception):
+    """The model could not produce a usable answer. The message is safe to show."""
+
+
+chat_config_defaults = dict(
     temperature=0.8,
     top_p=0.9,
     top_k=20,
@@ -43,154 +44,169 @@ classification_config = types.GenerateContentConfig(
 _intent_cache: Dict[str, str] = {}
 MAX_CACHE_SIZE = 100
 
+# Visualizers the site already has, as {key: description}. The browser runs
+# these from tested generators, so a "builtin" suggestion needs no generation.
+# Empty until the frontend can open them from the chat; suggestions naming a key
+# not listed here are dropped.
+BUILTIN_VISUALIZERS: Dict[str, str] = {}
 
-def clean_json_response(raw_text: str) -> str:
-    """Extract JSON from model response, handling surrounding text."""
-    match = re.search(r"```json\s*([\s\S]*?)\s*```", raw_text)
-    if match:
-        return match.group(1).strip()
-    # If no ```json block, try to parse the whole text as JSON
-    try:
-        json.loads(raw_text.strip())
-        return raw_text.strip()
-    except json.JSONDecodeError:
-        return raw_text.strip() # Return original text if not a valid JSON block
+# How much of the answer the suggestion and scene calls see.
+MAX_CONTEXT_CHARS = 6000
 
-async def get_visualization_data(user_query: str) -> Optional[Dict[str, Any]]:
-    """Generate visualization data."""
-    try:
-        chat = client.aio.chats.create(
-            model=DEFAULT_MODEL,
-            config=visualization_config,
-        )
-        response = await chat.send_message(
-            VISUALIZATION_PROMPT + "\n\n" + user_query
-        )
-        cleaned_text = clean_json_response(response.text)
-        return json.loads(cleaned_text) if cleaned_text else None
-    except Exception as e:
-        logger.error(f"Visualization error: {str(e)}")
-        return None
 
-async def get_chat_response(
-    user_query: str, system_prompt: str, chat_history: List[Dict[str, str]] = None
-) -> str:
-    """Generate full text response with chat history (non-streaming).
+def _history_contents(chat_history: Optional[List[Dict[str, str]]]) -> List[types.Content]:
+    contents = []
+    for msg in chat_history or []:
+        role = "user" if msg["role"] == "user" else "model"
+        contents.append(types.Content(role=role, parts=[types.Part(text=msg["content"])]))
+    return contents
 
-    Args:
-        user_query: The current user query
-        system_prompt: System instructions for the model
-        chat_history: List of previous messages [{"role": "user", "content": "..."}, ...]
-
-    """
-    try:
-        # Prepare history in the format expected by google.genai
-        # [{'role': 'user', 'parts': [{'text': '...'}]}, {'role': 'model', 'parts': [{'text': '...'}]}]
-        history = []
-        if chat_history:
-            for message in chat_history:
-                role = "user" if message["role"] == "user" else "model"
-                history.append(types.Content(role=role, parts=[types.Part(text=message["content"])]))
-
-        chat = client.aio.chats.create(
-            model=DEFAULT_MODEL,
-            config=chat_config,
-            history=history
-        )
-        if system_prompt:
-            # Sent as the first message rather than as a system instruction,
-            # preserving the original behaviour.
-            await chat.send_message(system_prompt)
-
-        response = await chat.send_message(user_query)
-        return response.text.strip()
-    except Exception as e:
-        logger.error(f"Chat error: {str(e)}")
-        return "I couldn't generate a response. Please try again."
 
 async def stream_chat_response(
     user_query: str, system_prompt: str, chat_history: List[Dict[str, str]] = None
 ) -> AsyncGenerator[str, None]:
     """Stream text response chunks with chat history.
 
-    Args:
-        user_query: The current user query
-        system_prompt: System instructions for the model
-        chat_history: List of previous messages [{"role": "user", "content": "..."}, ...]
+    The system prompt goes in ``system_instruction``. It used to be sent as the
+    first *user* turn, which the model treats as something the user said and can
+    answer, quote or argue with.
 
+    Raises ``GenerationError`` if the model fails, so the caller can send an
+    error event instead of saving "Error generating response." as the answer.
     """
-    try:
-        # Construct contents list
-        contents = []
-        if system_prompt:
-             contents.append(types.Content(role="user", parts=[types.Part(text=system_prompt)]))
-        if chat_history:
-            for msg in chat_history:
-                role = "user" if msg["role"] == "user" else "model"
-                contents.append(types.Content(role=role, parts=[types.Part(text=msg["content"])]))
-        contents.append(types.Content(role="user", parts=[types.Part(text=user_query)]))
+    contents = _history_contents(chat_history)
+    contents.append(types.Content(role="user", parts=[types.Part(text=user_query)]))
+    config = types.GenerateContentConfig(
+        **chat_config_defaults,
+        system_instruction=system_prompt or None,
+    )
 
-        # Stream response
-        # Using generate_content_stream for one-off generation with context manually constructed,
-        # mirroring the previous logic which passed a list of contents.
+    try:
         response = await client.aio.models.generate_content_stream(
             model=DEFAULT_MODEL,
             contents=contents,
-            config=chat_config,
+            config=config,
         )
         async for chunk in response:
-            logger.debug(f"Response chunk: {chunk.text}")
-            yield chunk.text
+            if chunk.text:
+                yield chunk.text
     except Exception as e:
         logger.error(f"Streaming error: {str(e)}")
-        yield "Error generating response."
+        raise GenerationError("The model could not generate a response.") from e
 
 
+def _builtins_text() -> str:
+    if not BUILTIN_VISUALIZERS:
+        return "  (none available yet: always use \"trace\")"
+    return "\n".join(f"  - {key}: {desc}" for key, desc in BUILTIN_VISUALIZERS.items())
 
-async def get_contextual_visualization_data(
-    user_query: str,
-    chat_history: List[Dict[str, str]] = None,
-    algorithm_context: str = None,
-) -> Optional[Dict[str, Any]]:
-    """Generate visualization data with conversation and example context."""
+
+async def suggest_visualizations(question: str, answer: str) -> List[Suggestion]:
+    """Up to three visualizations worth offering under an answer.
+
+    Never raises: suggestions are an extra, and a failure here must not turn a
+    good answer into an error.
+    """
+    prompt = (
+        f"User's question:\n{question[:2000]}\n\n"
+        f"Tutor's answer:\n{answer[:MAX_CONTEXT_CHARS]}"
+    )
+    config = types.GenerateContentConfig(
+        temperature=0.3,
+        max_output_tokens=1200,
+        system_instruction=SUGGESTION_PROMPT.replace("{builtins}", _builtins_text()),
+        response_mime_type="application/json",
+        response_schema=SuggestionList,
+    )
     try:
-        context_prompt = VISUALIZATION_PROMPT
-
-        if algorithm_context:
-            context_prompt += f"\n\nAlgorithm Solution Context:\n{algorithm_context}\n"
-
-        if chat_history:
-            recent_context = []
-            for msg in chat_history[-4:]:
-                if any(
-                    keyword in msg.get("content", "").lower()
-                    for keyword in ["algorithm", "solution", "code", "problem", "example"]
-                ):
-                    recent_context.append(f"{msg['role']}: {msg['content'][:300]}...")
-
-            if recent_context:
-                context_prompt += "\n\nRecent Conversation Context:\n" + "\n".join(recent_context) + "\n"
-
-
-        chat = client.aio.chats.create(
-            model=DEFAULT_MODEL,
-            config=visualization_config,
+        start = time.perf_counter()
+        response = await client.aio.models.generate_content(
+            model=DEFAULT_MODEL, contents=prompt, config=config
         )
-        response = await chat.send_message(context_prompt + "\n\nUser Request: " + user_query)
-
-        cleaned_text = clean_json_response(response.text)
-        result = json.loads(cleaned_text) if cleaned_text else None
-
-        if result and isinstance(result, dict):
-            logger.info(f"Generated contextual visualization using example data for: {user_query[:50]}...")
-            return result
-        else:
-            logger.warning(f"Generated invalid visualization data: {cleaned_text[:200]}...")
-            return None
-
+        parsed = response.parsed
+        if not isinstance(parsed, SuggestionList):
+            parsed = SuggestionList.model_validate_json(response.text or "{}")
+        logger.info(f"Suggestions: {len(parsed.suggestions)} in {time.perf_counter() - start:.2f}s")
     except Exception as e:
-        logger.error(f"Contextual visualization error: {str(e)}")
-        return None
+        logger.warning(f"Suggestion generation failed: {e}")
+        return []
+
+    kept = []
+    for suggestion in parsed.suggestions:
+        if suggestion.kind == "builtin" and (
+            suggestion.builtin is None or suggestion.builtin.key not in BUILTIN_VISUALIZERS
+        ):
+            continue
+        kept.append(suggestion)
+    return kept[:3]
+
+
+def _scene_request_text(trace: TraceRequest, context: Optional[str]) -> str:
+    text = (
+        f"Problem: {trace.problem}\n"
+        f"Input: {trace.input}\n"
+        f"Approach to trace: {trace.approach}\n"
+    )
+    if context:
+        text += (
+            "\nThe conversation this came from (trace the same solution, in the "
+            f"same language if it shows code):\n{context[:MAX_CONTEXT_CHARS]}\n"
+        )
+    return text
+
+
+async def generate_scene(
+    trace: TraceRequest, context: Optional[str] = None, language: str = "python"
+) -> Scene:
+    """Generate a validated scene, retrying once with the validation error.
+
+    The schema constrains the shape, but not cross-references such as "this
+    highlight names a declared structure" or "code_line is within the code".
+    When those fail, the model gets its own output and the error back, which
+    fixes the large majority of near-misses.
+    """
+    config = types.GenerateContentConfig(
+        temperature=0.4,
+        max_output_tokens=16000,
+        system_instruction=SCENE_PROMPT.replace("{language}", language),
+        response_mime_type="application/json",
+        response_schema=Scene,
+    )
+    contents: List[types.Content] = [
+        types.Content(role="user", parts=[types.Part(text=_scene_request_text(trace, context))])
+    ]
+
+    last_error = "unknown error"
+    for attempt in range(2):
+        try:
+            response = await client.aio.models.generate_content(
+                model=DEFAULT_MODEL, contents=contents, config=config
+            )
+        except Exception as e:
+            logger.error(f"Scene generation call failed: {e}")
+            raise GenerationError("The visualization service is unavailable right now.") from e
+
+        raw = response.text or ""
+        try:
+            # Validate from the raw JSON rather than trusting `response.parsed`:
+            # the SDK skips Pydantic validators when parsing fails, and the
+            # cross-reference checks live in those validators.
+            return Scene.model_validate_json(raw)
+        except ValidationError as e:
+            last_error = "; ".join(err["msg"] for err in e.errors()[:5])
+            logger.info(f"Scene attempt {attempt + 1} invalid: {last_error}")
+            contents += [
+                types.Content(role="model", parts=[types.Part(text=raw[:20000])]),
+                types.Content(
+                    role="user",
+                    parts=[types.Part(text=(
+                        f"That scene is invalid: {last_error}. "
+                        "Return the corrected complete scene."
+                    ))],
+                ),
+            ]
+
+    raise GenerationError(f"Couldn't build a valid visualization ({last_error}).")
 
 
 async def classify_intent_with_llm(user_query: str) -> str:
@@ -221,7 +237,6 @@ async def classify_intent_with_llm(user_query: str) -> str:
 
             # Update cache (simple FIFO-ish pruning if it gets too big)
             if len(_intent_cache) >= MAX_CACHE_SIZE:
-                # Remove a random key or first key if needed, here just clearing oldest entry
                 oldest_key = next(iter(_intent_cache))
                 del _intent_cache[oldest_key]
 

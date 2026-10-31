@@ -1,9 +1,8 @@
 """The scene and suggestion schemas.
 
 Gemini's structured output guarantees the shape, but not that a step refers to
-structures that exist or code lines that are there. These checks are what make
-the retry in generate_scene worth anything, and what stop a half-consistent
-scene from reaching the player.
+structures that exist or code lines that are there. Slips that can be repaired
+are; only what can't be drawn at all fails (and is retried once).
 """
 
 import copy
@@ -11,7 +10,7 @@ import copy
 import pytest
 from pydantic import ValidationError
 
-from app.schemas.visualization_schemas import Scene, Suggestion
+from app.schemas.visualization_schemas import CONTEXT_SUGGESTION, Scene, SceneResult, Suggestion
 
 TWO_SUM = {
     "title": "Two Sum with a hash map",
@@ -83,41 +82,48 @@ def test_a_well_formed_scene_validates():
     assert parsed.steps[1].pointers[0].name == "i"
 
 
-def test_a_step_may_not_name_an_undeclared_structure():
+def test_highlights_naming_an_undeclared_structure_are_dropped():
+    """It used to reject the whole scene, which the user saw as an error."""
     data = scene()
     data["steps"][1]["highlights"][0]["structure"] = "ghost"
-    with pytest.raises(ValidationError, match="ghost"):
-        Scene.model_validate(data)
+    parsed = Scene.model_validate(data)
+    assert parsed.steps[1].highlights == []
+    assert any("undeclared" in r for r in parsed._repairs)
 
 
-def test_a_code_line_must_exist():
+def test_an_out_of_range_code_line_is_dropped():
     data = scene()
     data["steps"][0]["code_line"] = 99
-    with pytest.raises(ValidationError, match="code line 99"):
-        Scene.model_validate(data)
+    assert Scene.model_validate(data).steps[0].code_line is None
 
 
-def test_a_code_line_needs_code():
+def test_code_lines_without_code_are_dropped():
     data = scene(code=None)
-    with pytest.raises(ValidationError, match="code line"):
-        Scene.model_validate(data)
+    assert all(step.code_line is None for step in Scene.model_validate(data).steps)
 
 
-def test_each_structure_type_needs_its_own_field():
+def test_a_structure_missing_from_a_step_is_carried_over():
+    data = scene()
+    del data["steps"][2]["states"][1]  # the map is not restated in the last step
+    parsed = Scene.model_validate(data)
+    assert parsed.steps[2].states[1].entries[0].key == "2"
+
+
+def test_the_first_step_must_give_every_structure_contents():
+    """Nothing to carry over from, so this one can't be repaired."""
     data = scene()
     data["steps"][0]["states"][1] = {"structure": "seen", "items": ["2"]}
-    with pytest.raises(ValidationError, match="needs `entries`"):
+    with pytest.raises(ValidationError, match="entries is required"):
         Scene.model_validate(data)
 
 
-def test_bars_must_be_numeric():
+def test_bars_holding_text_are_drawn_as_an_array():
     data = scene(structures=[{"id": "a", "type": "bars", "label": "a"}], code=None)
     data["steps"] = [{
         "title": "t", "explanation": "e",
         "states": [{"structure": "a", "items": ["3", "x"]}],
     }]
-    with pytest.raises(ValidationError, match="non-numeric"):
-        Scene.model_validate(data)
+    assert Scene.model_validate(data).structures[0].type == "array"
 
 
 def test_blank_explanations_are_rejected():
@@ -127,18 +133,18 @@ def test_blank_explanations_are_rejected():
         Scene.model_validate(data)
 
 
-def test_duplicate_structure_ids_are_rejected():
+def test_a_duplicate_structure_is_dropped():
     data = scene()
     data["structures"].append({"id": "nums", "type": "array", "label": "again"})
-    with pytest.raises(ValidationError, match="unique"):
-        Scene.model_validate(data)
+    assert [s.label for s in Scene.model_validate(data).structures].count("again") == 0
 
 
-def test_too_many_steps_are_rejected():
+def test_too_many_steps_are_truncated_with_a_note():
     data = scene()
-    data["steps"] = data["steps"][1:2] * 41
-    with pytest.raises(ValidationError, match="too many steps"):
-        Scene.model_validate(data)
+    data["steps"] = data["steps"][1:2] * 45
+    parsed = Scene.model_validate(data)
+    assert len(parsed.steps) == 40
+    assert "cut short" in parsed.steps[-1].explanation
 
 
 def test_unknown_structure_types_are_rejected():
@@ -148,12 +154,21 @@ def test_unknown_structure_types_are_rejected():
         Scene.model_validate(data)
 
 
-def test_a_suggestion_must_carry_the_request_its_kind_needs():
+def test_a_feasible_result_needs_a_scene():
+    with pytest.raises(ValidationError, match="needs a scene"):
+        SceneResult.model_validate({"feasible": True})
+
+
+def test_a_decline_always_carries_a_reason():
+    assert SceneResult.model_validate({"feasible": False}).reason
+    assert SceneResult.model_validate({"feasible": False, "reason": "A proof."}).reason == "A proof."
+
+
+def test_suggestion_kinds():
+    assert CONTEXT_SUGGESTION.kind == "context"
     Suggestion.model_validate({
         "title": "Two Sum", "kind": "trace",
         "trace": {"problem": "Two Sum", "input": "[2,7]", "approach": "hash map"},
     })
     with pytest.raises(ValidationError, match="needs `trace`"):
         Suggestion.model_validate({"title": "Two Sum", "kind": "trace"})
-    with pytest.raises(ValidationError, match="needs `builtin`"):
-        Suggestion.model_validate({"title": "DP", "kind": "builtin"})

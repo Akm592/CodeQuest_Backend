@@ -54,8 +54,10 @@ QUESTION_HTML = (
 def reset_problem_cache():
     """Clear the real module-level cache around every test."""
     leetcode_scraper._problems_cache = None
+    leetcode_scraper._retry_after = 0.0
     yield
     leetcode_scraper._problems_cache = None
+    leetcode_scraper._retry_after = 0.0
 
 
 @pytest.fixture
@@ -94,6 +96,29 @@ async def test_fetch_all_problems_handles_an_http_error(http_client):
         "boom", request=MagicMock(), response=MagicMock(status_code=500)
     )
     assert await leetcode_scraper._fetch_all_problems() is None
+
+
+async def test_a_failed_download_is_not_retried_on_every_message(http_client):
+    """Remember a failure instead of retrying on every message.
+
+    The response-time bug: after one failure, every coding question used to
+    wait on the download again, because an empty cache read as "not cached".
+    """
+    http_client.get.side_effect = httpx.RequestError("blocked")
+
+    assert await leetcode_scraper._fetch_all_problems() is None
+    assert await leetcode_scraper._fetch_all_problems() is None
+    assert await leetcode_scraper._fetch_all_problems() is None
+
+    assert http_client.get.await_count == 1
+
+
+async def test_a_failed_download_is_retried_after_the_backoff(http_client):
+    http_client.get.side_effect = [httpx.RequestError("blocked"), _json_response({"stat_status_pairs": PROBLEMS})]
+
+    assert await leetcode_scraper._fetch_all_problems() is None
+    leetcode_scraper._retry_after = 0.0  # the backoff has elapsed
+    assert await leetcode_scraper._fetch_all_problems() == PROBLEMS
 
 
 async def test_fetch_all_problems_handles_a_connection_error(http_client):

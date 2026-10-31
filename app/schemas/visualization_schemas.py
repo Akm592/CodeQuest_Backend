@@ -24,7 +24,7 @@ once with the error message if a generated scene fails.
 
 from typing import List, Literal, Optional
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, PrivateAttr, model_validator
 
 # The structure kinds the frontend can draw. Extend this and the frontend's
 # renderer registry together.
@@ -143,96 +143,178 @@ class Scene(BaseModel):
     code: Optional[CodeBlock] = None
     steps: List[SceneStep]
 
+    # What _repair changed, for logging. Not part of the schema.
+    _repairs: List[str] = PrivateAttr(default_factory=list)
+
     @model_validator(mode="after")
-    def _consistent(self) -> "Scene":
+    def _repair(self) -> "Scene":
+        """Fix the slips that can be fixed; fail only on what can't be drawn.
+
+        The first version rejected a whole scene over any inconsistency: one
+        highlight naming a misspelled structure, a code line one past the
+        end, a 41st step. Those are exactly the slips a model makes on a big
+        trace, and after one retry the user got "Couldn't build a valid
+        visualization" for a scene that was 99% right. They are now repaired
+        (and logged). Only problems with no sensible repair fail.
+        """
+        repairs = self._repairs
         if not self.structures:
             raise ValueError("a scene needs at least one structure")
         if not self.steps:
             raise ValueError("a scene needs at least one step")
-        if len(self.steps) > MAX_SCENE_STEPS:
-            raise ValueError(f"too many steps ({len(self.steps)}); keep it to {MAX_SCENE_STEPS} or fewer")
 
-        ids = [s.id for s in self.structures]
-        if len(set(ids)) != len(ids):
-            raise ValueError("structure ids must be unique")
-        known = set(ids)
+        # Duplicate ids: keep the first declaration.
+        seen_ids = set()
+        unique = []
+        for spec in self.structures:
+            if spec.id in seen_ids:
+                repairs.append(f"dropped duplicate structure '{spec.id}'")
+                continue
+            seen_ids.add(spec.id)
+            unique.append(spec)
+        self.structures = unique
+
+        if len(self.steps) > MAX_SCENE_STEPS:
+            repairs.append(f"truncated {len(self.steps)} steps to {MAX_SCENE_STEPS}")
+            self.steps = self.steps[:MAX_SCENE_STEPS]
+            last = self.steps[-1]
+            last.explanation = last.explanation.rstrip() + " (The trace is cut short here to keep it readable.)"
+
+        # Bars that hold text can't be drawn as bars, but can as an array.
+        for spec in self.structures:
+            if spec.type != "bars":
+                continue
+            for step in self.steps:
+                for state in step.states:
+                    if state.structure == spec.id and any(not _is_number(x) for x in state.items or []):
+                        spec.type = "array"
+                        repairs.append(f"bars '{spec.id}' hold non-numbers; drawn as an array")
+                        break
+                if spec.type != "bars":
+                    break
+
+        known = {s.id for s in self.structures}
         types = {s.id: s.type for s in self.structures}
         line_count = len(self.code.lines) if self.code else 0
+        previous: dict = {}
 
         for n, step in enumerate(self.steps, start=1):
             if not step.explanation.strip():
                 raise ValueError(f"step {n} has no explanation")
+
             if step.code_line is not None and not 1 <= step.code_line <= line_count:
-                raise ValueError(f"step {n} points at code line {step.code_line}, but the code has {line_count} lines")
+                repairs.append(f"step {n}: dropped code line {step.code_line} (code has {line_count})")
+                step.code_line = None
 
-            for ref in [*(s.structure for s in step.states),
-                        *(h.structure for h in step.highlights),
-                        *(p.structure for p in step.pointers)]:
-                if ref not in known:
-                    raise ValueError(f"step {n} refers to structure '{ref}', which is not declared")
+            for field in ("highlights", "pointers"):
+                kept = [x for x in getattr(step, field) if x.structure in known]
+                if len(kept) != len(getattr(step, field)):
+                    repairs.append(f"step {n}: dropped {field} naming undeclared structures")
+                setattr(step, field, kept)
 
+            states = {}
             for state in step.states:
-                kind = types[state.structure]
-                if kind == "hashmap" and state.entries is None:
-                    raise ValueError(f"step {n}: hashmap '{state.structure}' needs `entries`")
-                if kind == "grid" and state.rows is None:
-                    raise ValueError(f"step {n}: grid '{state.structure}' needs `rows`")
-                if kind not in ("hashmap", "grid", "variables") and state.items is None:
-                    raise ValueError(f"step {n}: {kind} '{state.structure}' needs `items`")
+                if state.structure not in known:
+                    repairs.append(f"step {n}: dropped state of undeclared '{state.structure}'")
+                    continue
                 if state.items is not None and len(state.items) > MAX_ITEMS:
-                    raise ValueError(f"step {n}: '{state.structure}' has more than {MAX_ITEMS} items")
-                if kind == "bars":
-                    for item in state.items or []:
-                        try:
-                            float(item)
-                        except ValueError:
-                            raise ValueError(f"step {n}: bars '{state.structure}' holds non-numeric '{item}'")
+                    repairs.append(f"step {n}: truncated '{state.structure}' to {MAX_ITEMS} items")
+                    state.items = state.items[:MAX_ITEMS]
+                if _has_contents(types[state.structure], state):
+                    states[state.structure] = state
+
+            # A structure missing from a step (or given the wrong field) keeps
+            # its contents from the step before. Only the first step has
+            # nothing to fall back on.
+            for spec in self.structures:
+                if spec.type == "variables" or spec.id in states:
+                    continue
+                if spec.id not in previous:
+                    raise ValueError(
+                        f"step {n} gives no contents for {spec.type} '{spec.id}' "
+                        f"({_FIELD_FOR.get(spec.type, 'items')} is required)"
+                    )
+                repairs.append(f"step {n}: carried '{spec.id}' over from the previous step")
+                states[spec.id] = previous[spec.id].model_copy(deep=True)
+
+            step.states = [states[s.id] for s in self.structures if s.id in states]
+            previous = states
+        return self
+
+
+_FIELD_FOR = {"hashmap": "entries", "grid": "rows"}
+
+
+def _is_number(value: str) -> bool:
+    try:
+        float(value)
+        return True
+    except ValueError:
+        return False
+
+
+def _has_contents(kind: str, state: "StructureState") -> bool:
+    if kind == "variables":
+        return True
+    if kind == "hashmap":
+        return state.entries is not None
+    if kind == "grid":
+        return state.rows is not None
+    return state.items is not None
+
+
+class SceneResult(BaseModel):
+    """Either a scene, or a reason why this can't be traced faithfully."""
+
+    feasible: bool = Field(
+        description="False when the problem cannot be traced faithfully step by step on a small input."
+    )
+    reason: str = Field(
+        default="",
+        description="When not feasible: one sentence saying why, addressed to the learner.",
+    )
+    scene: Optional[Scene] = None
+
+    @model_validator(mode="after")
+    def _scene_when_feasible(self) -> "SceneResult":
+        if self.feasible and self.scene is None:
+            raise ValueError("a feasible result needs a scene")
+        if not self.feasible and not self.reason.strip():
+            self.reason = "This one doesn't break down into clear steps on a small example."
         return self
 
 
 class TraceRequest(BaseModel):
-    """What to trace, for a suggestion that needs a generated scene."""
+    """A specific trace. Sent by suggestions saved before the single "Visualize this" button."""
 
     problem: str = Field(description="The problem or algorithm, e.g. 'Two Sum'.")
     input: str = Field(description="Concrete small input, e.g. 'nums = [2,7,11,15], target = 9'.")
     approach: str = Field(description="The approach to trace, e.g. 'one-pass hash map of complements'.")
 
 
-class BuiltinRequest(BaseModel):
-    """A visualizer the site already has; the browser runs it, no generation needed."""
-
-    key: str
-    # Free-form parameters as key/value pairs; the frontend validates them per key.
-    params: List[Entry] = Field(default_factory=list)
-
-
 class Suggestion(BaseModel):
     """A visualization offered under an answer."""
 
-    title: str = Field(description="Button text, under 60 characters, e.g. 'Hash map lookup for [2,7,11,15]'.")
-    kind: Literal["trace", "builtin"]
+    title: str
+    # "context": trace whatever the conversation is about, chosen on click.
+    # "trace": a specific request, from suggestions saved by the first version.
+    kind: Literal["context", "trace"]
     trace: Optional[TraceRequest] = None
-    builtin: Optional[BuiltinRequest] = None
 
     @model_validator(mode="after")
     def _matches_kind(self) -> "Suggestion":
         if self.kind == "trace" and self.trace is None:
             raise ValueError("a trace suggestion needs `trace`")
-        if self.kind == "builtin" and self.builtin is None:
-            raise ValueError("a builtin suggestion needs `builtin`")
         return self
 
 
-class SuggestionList(BaseModel):
-    """The visualizations offered under one answer."""
-
-    suggestions: List[Suggestion] = Field(default_factory=list, description="0 to 3 suggestions.")
+CONTEXT_SUGGESTION = Suggestion(title="Visualize this with an example", kind="context")
 
 
 class VisualizeRequest(BaseModel):
     """Body of POST /chat/visualize."""
 
-    trace: TraceRequest
-    # The question and answer the suggestion came from, so the scene traces the
-    # same solution the user just read.
-    context: Optional[str] = Field(default=None, max_length=12000)
+    # The question and answer the button sits under: the scene traces the same
+    # solution the user just read, on an example drawn from it.
+    context: str = Field(min_length=1, max_length=12000)
+    trace: Optional[TraceRequest] = None

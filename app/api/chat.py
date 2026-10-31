@@ -7,9 +7,11 @@ verified by ``app.core.auth`` and every database operation runs as them, so row
 level security applies.
 """
 
+import asyncio
 import hashlib
 import json
 import re
+import time
 import uuid
 from collections import OrderedDict
 from typing import Any, AsyncGenerator, Dict, List, Optional
@@ -23,13 +25,14 @@ from app.core.rate_limit import check_rate_limit
 from app.database.supabase_client import SupabaseManager
 from app.llm import gemini_integration
 from app.llm.prompts import CS_TUTOR_PROMPT, GENERAL_PROMPT
+from app.llm.viz_tag import VizTagFilter
 from app.memory.chat_memory import ChatMemory, ChatSession
 from app.schemas.chat_schemas import (
     SUPPORTED_LANGUAGES,
     ChatRequest,
     PendingContext,
 )
-from app.schemas.visualization_schemas import Suggestion, VisualizeRequest
+from app.schemas.visualization_schemas import CONTEXT_SUGGESTION, VisualizeRequest
 from app.scrapers.leetcode_scraper import fetch_leetcode_question, scrape_leetcode_question
 
 router = APIRouter()
@@ -123,21 +126,49 @@ def _solution_prompt(scraped: Dict[str, Any], language: str) -> str:
     )
 
 
-async def _suggest(question: str, answer: str, auto_open: bool = False):
-    """Offer visualizations for an answer.
+async def _stream_answer(
+    query: str,
+    system_prompt: str,
+    chat_history: List[Dict[str, str]],
+    marker: VizTagFilter,
+):
+    """Stream an answer with the visualization marker removed.
 
-    Yields the SSE event (if there is anything to offer) and finally the
-    suggestions as plain dicts, for storing with the message. Kept separate
-    from the answer stream so a failure here can never cost the user the
-    answer they already have.
+    Yields ``("event", sse_frame)`` for each piece of text, then
+    ``("done", full_text)`` with everything that was shown, for the caller to
+    store. The marker never reaches the user, the database, or the history
+    sent back to the model.
     """
-    suggestions: List[Suggestion] = []
-    if answer.strip():
-        suggestions = await gemini_integration.suggest_visualizations(question, answer)
-    data = [s.model_dump(exclude_none=True) for s in suggestions]
-    if data:
-        yield _sse({"type": "suggestions", "data": data, "autoOpen": auto_open})
-    yield data
+    shown = ""
+    started = time.perf_counter()
+    first_token: Optional[float] = None
+    async for chunk in gemini_integration.stream_chat_response(query, system_prompt, chat_history):
+        if first_token is None:
+            first_token = time.perf_counter() - started
+        text = marker.feed(chunk)
+        if text:
+            shown += text
+            yield "event", _sse({"type": "text", "content": text})
+    logger.info(
+        f"Answer: first token after {first_token or 0:.2f}s, "
+        f"{len(shown)} chars in {time.perf_counter() - started:.2f}s"
+    )
+    rest = marker.finish()
+    if rest:
+        shown += rest
+        yield "event", _sse({"type": "text", "content": rest})
+    yield "done", shown
+
+
+def _visualize_button(offer: bool) -> List[Dict[str, Any]]:
+    """Return the single "Visualize this with an example" button, if the answer earns one.
+
+    No model call happens here: whether to offer it was decided by the answer
+    itself (the marker), and nothing about the visualization is generated
+    until it is clicked. The answer is the only judge: if it decided the topic
+    can't be traced, there is no button, whatever the user asked.
+    """
+    return [CONTEXT_SUGGESTION.model_dump(exclude_none=True)] if offer else []
 
 
 def _suggestion_metadata(suggestions: List[Dict[str, Any]], auto_open: bool) -> Dict[str, Any]:
@@ -206,24 +237,23 @@ async def _stream_solution(
     """Generate and stream a LeetCode solution, then offer visualizations."""
     logger.info(f"[{session_id}] Generating solution in '{language}' (visualize={visualize}).")
 
+    marker = VizTagFilter()
     full_output = ""
-    async for chunk in gemini_integration.stream_chat_response(
-        user_query=_solution_prompt(scraped, language),
-        system_prompt=CS_TUTOR_PROMPT,
-        chat_history=[],
-    ):
-        full_output += chunk
-        yield _sse({"type": "text", "content": chunk})
+    async for kind, value in _stream_answer(_solution_prompt(scraped, language), CS_TUTOR_PROMPT, [], marker):
+        if kind == "event":
+            yield value
+        else:
+            full_output = value
 
     _clear_pending(chat_session)
     chat_session.add_message("bot", full_output)
 
-    suggestions: List[Dict[str, Any]] = []
-    async for item in _suggest(f"LeetCode: {scraped.get('title', '')}\n{question}", full_output, visualize):
-        if isinstance(item, str):
-            yield item
-        else:
-            suggestions = item
+    # Only the answer's own judgement (the marker) earns a button, even when the
+    # user asked to visualize: a button that opens onto "this can't be shown"
+    # is worse than no button.
+    suggestions = _visualize_button(marker.found)
+    if suggestions:
+        yield _sse({"type": "suggestions", "data": suggestions, "autoOpen": visualize})
 
     await _persist(
         db,
@@ -295,14 +325,26 @@ async def stream_response(
             return
 
         # --- A fresh turn ---------------------------------------------------
-        intent = await gemini_integration.classify_intent_with_llm(user_input)
+        # The intent call and the LeetCode lookup are independent network
+        # round trips, so they run side by side instead of one after the
+        # other. The lookup's result is simply ignored if the intent turns out
+        # not to need it.
+        started = time.perf_counter()
+        intent, looked_up = await asyncio.gather(
+            gemini_integration.classify_intent_with_llm(user_input),
+            scrape_leetcode_question(user_input),
+        )
         wants_visualization = intent == "visualization"
 
         scraped = None
         if intent in ("cs_tutor", "visualization") or re.search(
             r"leetcode\.com/problems/", user_input.lower()
         ) or re.match(r"^\s*\d+\s*[.]?", user_input):
-            scraped = await scrape_leetcode_question(user_input)
+            scraped = looked_up
+        logger.info(
+            f"[{session_id}] intent={intent} leetcode={bool(scraped)} "
+            f"routing took {time.perf_counter() - started:.2f}s"
+        )
 
         if scraped:
             language = preferred_language or detect_language(user_input)
@@ -347,31 +389,30 @@ async def stream_response(
         query = user_input
         if wants_visualization:
             query = (
-                f"{user_input}\n\n(The user asked for a visualization. An animated "
-                "step-by-step trace will be shown right below your answer, so keep the "
-                "explanation concise: the idea, the key steps, and the complexity. Do "
-                "not draw ASCII diagrams or ask whether they want a dry run.)"
+                f"{user_input}\n\n(The user asked for a visualization. If this can be "
+                "traced faithfully step by step on one small example, keep the explanation "
+                "concise (the idea, the key steps, the complexity), skip ASCII diagrams, "
+                "and end with the marker: the app shows the animation below your answer. "
+                "If it can't, explain the topic normally, say in one sentence why it "
+                "doesn't suit a step-by-step animation, and do not add the marker.)"
             )
 
+        marker = VizTagFilter()
         bot_text = ""
-        async for chunk in gemini_integration.stream_chat_response(
-            query, system_prompt, chat_history
-        ):
-            bot_text += chunk
-            yield _sse({"type": "text", "content": chunk})
+        async for kind, value in _stream_answer(query, system_prompt, chat_history, marker):
+            if kind == "event":
+                yield value
+            else:
+                bot_text = value
 
         if not bot_text:
             return
 
         chat_session.add_message("bot", bot_text)
 
-        suggestions: List[Dict[str, Any]] = []
-        if intent != "general" or wants_visualization:
-            async for item in _suggest(user_input, bot_text, wants_visualization):
-                if isinstance(item, str):
-                    yield item
-                else:
-                    suggestions = item
+        suggestions = _visualize_button(marker.found)
+        if suggestions:
+            yield _sse({"type": "suggestions", "data": suggestions, "autoOpen": wants_visualization})
 
         await _persist(
             db, session_id, "bot", bot_text, intent=intent,
@@ -440,7 +481,8 @@ SCENE_CACHE_SIZE = 200
 
 def _scene_cache_key(body: VisualizeRequest) -> str:
     raw = json.dumps(
-        {"trace": body.trace.model_dump(), "context": body.context or ""}, sort_keys=True
+        {"context": body.context, "trace": body.trace.model_dump() if body.trace else None},
+        sort_keys=True,
     )
     return hashlib.sha256(raw.encode()).hexdigest()
 
@@ -451,27 +493,32 @@ async def visualize_endpoint(
     request: Request,
     user: Optional[AuthenticatedUser] = Depends(get_current_user),
 ):
-    """Build the step-by-step scene for a suggestion the user clicked."""
+    """Build the trace for a "Visualize this" button the user clicked.
+
+    Returns ``{feasible, reason, scene}``. ``feasible: false`` is a normal
+    answer, not an error: the model judged the topic can't be traced
+    faithfully on a small example and said why, instead of inventing one.
+    """
     key = _scene_cache_key(body)
     cached = _SCENE_CACHE.get(key)
     if cached is not None:
         _SCENE_CACHE.move_to_end(key)
-        return {"scene": cached}
+        return cached
 
     if user is None:
         check_rate_limit(request)
 
-    language = detect_language(body.context or "") or "python"
+    language = detect_language(body.context) or "python"
     try:
-        scene = await gemini_integration.generate_scene(body.trace, body.context, language)
+        result = await gemini_integration.generate_scene(body.context, body.trace, language)
     except gemini_integration.GenerationError as exc:
         raise HTTPException(status_code=502, detail=str(exc))
 
-    data = scene.model_dump(exclude_none=True)
+    data = result.model_dump(exclude_none=True)
     _SCENE_CACHE[key] = data
     if len(_SCENE_CACHE) > SCENE_CACHE_SIZE:
         _SCENE_CACHE.popitem(last=False)
-    return {"scene": data}
+    return data
 
 
 @router.post("/chat")

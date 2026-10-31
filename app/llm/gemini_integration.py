@@ -7,18 +7,14 @@ from pydantic import ValidationError
 
 from app.core.config import settings
 from app.core.logger import logger
-from app.llm.prompts import INTENT_CLASSIFICATION_PROMPT, SCENE_PROMPT, SUGGESTION_PROMPT
-from app.schemas.visualization_schemas import (
-    Scene,
-    Suggestion,
-    SuggestionList,
-    TraceRequest,
-)
+from app.llm.prompts import INTENT_CLASSIFICATION_PROMPT, SCENE_PROMPT
+from app.schemas.visualization_schemas import SceneResult, TraceRequest
 
 client = genai.Client(api_key=settings.GEMINI_API_KEY)
 
 # Default model to use - configurable via GEMINI_MODEL env var
 DEFAULT_MODEL = settings.GEMINI_MODEL
+SCENE_MODEL = settings.GEMINI_SCENE_MODEL
 
 
 class GenerationError(Exception):
@@ -44,13 +40,7 @@ classification_config = types.GenerateContentConfig(
 _intent_cache: Dict[str, str] = {}
 MAX_CACHE_SIZE = 100
 
-# Visualizers the site already has, as {key: description}. The browser runs
-# these from tested generators, so a "builtin" suggestion needs no generation.
-# Empty until the frontend can open them from the chat; suggestions naming a key
-# not listed here are dropped.
-BUILTIN_VISUALIZERS: Dict[str, str] = {}
-
-# How much of the answer the suggestion and scene calls see.
+# How much of the conversation the scene call sees.
 MAX_CONTEXT_CHARS = 6000
 
 
@@ -95,92 +85,44 @@ async def stream_chat_response(
         raise GenerationError("The model could not generate a response.") from e
 
 
-def _builtins_text() -> str:
-    if not BUILTIN_VISUALIZERS:
-        return "  (none available yet: always use \"trace\")"
-    return "\n".join(f"  - {key}: {desc}" for key, desc in BUILTIN_VISUALIZERS.items())
-
-
-async def suggest_visualizations(question: str, answer: str) -> List[Suggestion]:
-    """Up to three visualizations worth offering under an answer.
-
-    Never raises: suggestions are an extra, and a failure here must not turn a
-    good answer into an error.
-    """
-    prompt = (
-        f"User's question:\n{question[:2000]}\n\n"
-        f"Tutor's answer:\n{answer[:MAX_CONTEXT_CHARS]}"
-    )
-    config = types.GenerateContentConfig(
-        temperature=0.3,
-        max_output_tokens=1200,
-        system_instruction=SUGGESTION_PROMPT.replace("{builtins}", _builtins_text()),
-        response_mime_type="application/json",
-        response_schema=SuggestionList,
-    )
-    try:
-        start = time.perf_counter()
-        response = await client.aio.models.generate_content(
-            model=DEFAULT_MODEL, contents=prompt, config=config
-        )
-        parsed = response.parsed
-        if not isinstance(parsed, SuggestionList):
-            parsed = SuggestionList.model_validate_json(response.text or "{}")
-        logger.info(f"Suggestions: {len(parsed.suggestions)} in {time.perf_counter() - start:.2f}s")
-    except Exception as e:
-        logger.warning(f"Suggestion generation failed: {e}")
-        return []
-
-    kept = []
-    for suggestion in parsed.suggestions:
-        if suggestion.kind == "builtin" and (
-            suggestion.builtin is None or suggestion.builtin.key not in BUILTIN_VISUALIZERS
-        ):
-            continue
-        kept.append(suggestion)
-    return kept[:3]
-
-
-def _scene_request_text(trace: TraceRequest, context: Optional[str]) -> str:
-    text = (
-        f"Problem: {trace.problem}\n"
-        f"Input: {trace.input}\n"
-        f"Approach to trace: {trace.approach}\n"
-    )
-    if context:
+def _scene_request_text(context: str, trace: Optional[TraceRequest]) -> str:
+    text = f"The conversation:\n{context[:MAX_CONTEXT_CHARS]}\n"
+    if trace is not None:
+        # Suggestions saved by the first version named a specific trace.
         text += (
-            "\nThe conversation this came from (trace the same solution, in the "
-            f"same language if it shows code):\n{context[:MAX_CONTEXT_CHARS]}\n"
+            f"\nTrace specifically: {trace.problem}, on input {trace.input}, "
+            f"using {trace.approach}.\n"
         )
     return text
 
 
 async def generate_scene(
-    trace: TraceRequest, context: Optional[str] = None, language: str = "python"
-) -> Scene:
-    """Generate a validated scene, retrying once with the validation error.
+    context: str, trace: Optional[TraceRequest] = None, language: str = "python"
+) -> SceneResult:
+    """Trace the conversation's solution, or explain why it can't be traced.
 
-    The schema constrains the shape, but not cross-references such as "this
-    highlight names a declared structure" or "code_line is within the code".
-    When those fail, the model gets its own output and the error back, which
-    fixes the large majority of near-misses.
+    Called only when the user clicks "Visualize this", so nothing is spent on
+    answers whose button is never pressed. The model may decline
+    (``feasible: false``) rather than invent an example the problem doesn't
+    support. Small inconsistencies are repaired by the ``Scene`` validator;
+    only problems it can't repair are sent back once with the error.
     """
     config = types.GenerateContentConfig(
-        temperature=0.4,
+        temperature=0.3,
         max_output_tokens=16000,
         system_instruction=SCENE_PROMPT.replace("{language}", language),
         response_mime_type="application/json",
-        response_schema=Scene,
+        response_schema=SceneResult,
     )
     contents: List[types.Content] = [
-        types.Content(role="user", parts=[types.Part(text=_scene_request_text(trace, context))])
+        types.Content(role="user", parts=[types.Part(text=_scene_request_text(context, trace))])
     ]
 
     last_error = "unknown error"
     for attempt in range(2):
         try:
             response = await client.aio.models.generate_content(
-                model=DEFAULT_MODEL, contents=contents, config=config
+                model=SCENE_MODEL, contents=contents, config=config
             )
         except Exception as e:
             logger.error(f"Scene generation call failed: {e}")
@@ -190,8 +132,8 @@ async def generate_scene(
         try:
             # Validate from the raw JSON rather than trusting `response.parsed`:
             # the SDK skips Pydantic validators when parsing fails, and the
-            # cross-reference checks live in those validators.
-            return Scene.model_validate_json(raw)
+            # repairs live in those validators.
+            result = SceneResult.model_validate_json(raw)
         except ValidationError as e:
             last_error = "; ".join(err["msg"] for err in e.errors()[:5])
             logger.info(f"Scene attempt {attempt + 1} invalid: {last_error}")
@@ -200,11 +142,16 @@ async def generate_scene(
                 types.Content(
                     role="user",
                     parts=[types.Part(text=(
-                        f"That scene is invalid: {last_error}. "
-                        "Return the corrected complete scene."
+                        f"That result is invalid: {last_error}. "
+                        "Return the corrected complete result."
                     ))],
                 ),
             ]
+            continue
+
+        if result.scene is not None and result.scene._repairs:
+            logger.info(f"Scene repaired: {'; '.join(result.scene._repairs)}")
+        return result
 
     raise GenerationError(f"Couldn't build a valid visualization ({last_error}).")
 

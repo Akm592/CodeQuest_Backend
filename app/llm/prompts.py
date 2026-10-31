@@ -7,44 +7,63 @@ both in prose, with worked JSON templates whose array literals had been
 stripped (``"array": ,``), so it taught the model invalid JSON.
 """
 
-SUGGESTION_PROMPT = """You suggest visualizations for a computer science tutoring chat.
+# The "Visualize this with an example" button costs no extra model call: the
+# tutor decides, inside its own answer, whether a trace would help, and marks
+# it. app/llm/viz_tag.py strips the marker from the stream before anyone sees
+# it. Nothing about the visualization is generated until the button is
+# clicked.
+VIZ_MARKER = "<viz/>"
 
-You are given the user's latest question and the tutor's answer. Suggest 0 to 3
-visualizations that would make the answer click: an animated, step-by-step trace
-of an algorithm running on a small concrete input.
+VIZ_MARKER_RULE = """
 
-When to suggest:
-- The answer explains an algorithm, a data structure operation, or a coding
-  problem's solution (sorting, searching, two pointers, sliding window, hashing,
-  stacks/queues, linked lists, recursion, dynamic programming, BFS/DFS, ...).
-- Suggest NOTHING (an empty list) for greetings, chit-chat, career questions,
-  definitions with no process to animate, or anything off-topic.
+### Visualization marker (invisible to the user)
+The app can animate a trace of an algorithm running on ONE small concrete
+example: arrays, pointers, hash maps, stacks, queues, linked lists, grids or
+DP tables changing step by step, next to the code. Add the marker only when
+such a trace genuinely exists for this answer and you are confident it would
+be correct and useful. Then end the whole answer with the exact marker <viz/>
+on its own line, and the app shows a "Visualize this with an example" button.
 
-How to write each suggestion:
-- `title`: a concrete button label under 60 characters naming the operation and
-  the input, e.g. "Hash map lookup for [2,7,11,15], target 9". Never generic
-  ("Visualize this").
-- Pick a SMALL input (4-8 elements) that exercises the interesting case, e.g.
-  includes a duplicate, a match, or a pointer crossing. Reuse the example from
-  the conversation when there is one.
-- If there are two meaningfully different approaches (brute force vs optimal),
-  you may suggest both, optimal first.
+Add it for: a concrete algorithm or data-structure operation (sorting,
+searching, two pointers, sliding window, hashing, stack/queue use, linked-list
+manipulation, recursion or backtracking on a small input, BFS/DFS on a small
+grid, dynamic programming tables), or the solution to a coding problem.
 
-Kinds:
-- "builtin": use ONLY when the topic matches one of these site visualizers, and
-  fill `builtin.key` with the key exactly:
-{builtins}
-  Put any inputs in `builtin.params` as key/value strings, e.g. key "source",
-  value "kitten".
-- "trace": everything else. Fill `trace.problem`, `trace.input` (concrete values)
-  and `trace.approach` (the specific technique to trace).
+Never add it for: proofs and impossibility results (the halting problem,
+P vs NP), theory or mathematical derivations, definitions or concepts with no
+process to run, comparisons, complexity discussions on their own, system
+design, networking or OS internals, probabilistic algorithms, history, careers,
+chit-chat, or an answer that only asks the user a question. When in doubt,
+leave it out: a button that leads nowhere is worse than no button.
+
+Never mention the marker, and never write it anywhere except as the very last
+line.
 """
 
 SCENE_PROMPT = """You produce step-by-step visual traces of algorithms for learners.
 
-Trace the requested approach on the given input, exactly as the code would run,
-and return a scene: the data structures involved, the code, and one step per
-meaningful operation.
+You are given a conversation: the learner's question and the tutor's answer.
+Trace the main approach the answer explains, running on a small example, and
+return it as a scene.
+
+First decide whether that is possible faithfully. Return `feasible: false`
+with a one-sentence `reason` (written to the learner) when the topic can't be
+shown honestly as a short sequence of data-structure states, for example:
+heavy mathematics, randomised or probabilistic algorithms, concurrency, system
+design, or a process whose state is far too large to show on a small input.
+Never invent a problem or a solution the conversation doesn't contain; it is
+better to decline than to show something wrong.
+
+Otherwise return `feasible: true` and a `scene`.
+
+Choosing the example:
+- Use the example from the question or the answer when there is one.
+- Otherwise pick the smallest input (4-8 elements) that satisfies the
+  problem's constraints and exercises the interesting case (a match, a
+  duplicate, a pointer crossing, a backtrack).
+- Check that the input is VALID for the problem before tracing it (e.g. Two
+  Sum must have exactly one answer; a binary search input must be sorted).
+- Say what the example is in the `summary`.
 
 Structures (declare each once in `structures`, then give its full contents in
 every step's `states`):
@@ -63,7 +82,7 @@ algorithm actually reads or writes (Two Sum needs the array AND the hash map).
 
 Steps:
 - 6 to 20 steps. One step per meaningful operation: a comparison, an insert, a
-  pointer move, a swap. Skip boring repetition only if the explanation says so.
+  pointer move, a swap.
 - `title`: 3-8 words naming the operation ("Store 2 at index 0").
 - `explanation`: 1-3 full sentences saying what happens AND why, tied to the
   idea of the approach ("9 - 7 = 2 is already in the map, so the pair is
@@ -80,7 +99,8 @@ Steps:
 
 Code: give a short, correct, idiomatic solution in `code` ({language}, unless the
 conversation used another language), one source line per entry, 25 lines at
-most, with no line numbers. Steps must follow this exact code.
+most, with no line numbers. It must implement the approach the answer
+explained. Steps must follow this exact code.
 
 All values are strings: write 7 as "7". Keep every state consistent with the
 previous step plus the operation the step describes.
@@ -137,7 +157,7 @@ For every problem or concept, follow a structured, interactive flow to engage th
 By following this interactive flow and guidelines, your responses will be engaging, educational, adaptive, and accessible. Remember, **all output must be in Markdown format** to ensure clarity and readability.
 
 Happy tutoring!
-"""
+""" + VIZ_MARKER_RULE
 
 
 

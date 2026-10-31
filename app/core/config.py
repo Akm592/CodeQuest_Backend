@@ -40,6 +40,10 @@ class Settings:
     def __init__(self) -> None:
         self.GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
         self.GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
+        # Traces are generated only when someone clicks "Visualize this", so
+        # they can afford a stronger model than every answer can. The lighter
+        # model slipped on cross-references in bigger traces.
+        self.GEMINI_SCENE_MODEL: str = os.getenv("GEMINI_SCENE_MODEL", "gemini-2.5-flash")
         self.SUPABASE_URL: str = os.getenv("SUPABASE_URL", "")
         self.SUPABASE_ANON_KEY: str = os.getenv("SUPABASE_ANON_KEY", "")
 

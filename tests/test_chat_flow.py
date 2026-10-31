@@ -12,7 +12,7 @@ import pytest
 
 from app.api.chat import _SCENE_CACHE, chat_memory
 from app.llm.gemini_integration import GenerationError
-from app.schemas.visualization_schemas import Scene, Suggestion
+from app.schemas.visualization_schemas import Scene, SceneResult
 
 SESSION = "aaaaaaaa-0000-0000-0000-000000000001"
 
@@ -38,17 +38,6 @@ SCRAPED = {
 }
 
 
-SUGGESTION = Suggestion.model_validate({
-    "title": "Hash map lookup for [2,7,11,15]",
-    "kind": "trace",
-    "trace": {
-        "problem": "Two Sum",
-        "input": "nums = [2,7,11,15], target = 9",
-        "approach": "one-pass hash map",
-    },
-})
-
-
 def frames(response):
     """Parse the SSE body into a list of event payloads."""
     return [
@@ -63,19 +52,19 @@ def leetcode_flow():
     """Mock the network edges and capture the prompt sent to the model."""
     captured = {}
 
+    # The answer ends with the visualization marker, split across chunks the
+    # way a real stream can split it.
+    captured["chunks"] = ["Here is ", "the solution.\n<vi", "z/>"]
+
     async def fake_stream(user_query, system_prompt, chat_history=None):
         captured["prompt"] = user_query
-        for chunk in ["Here is ", "the solution."]:
+        captured["system_prompt"] = system_prompt
+        for chunk in captured["chunks"]:
             yield chunk
-
-    suggest = AsyncMock(return_value=[SUGGESTION])
-    captured["suggest"] = suggest
 
     with patch(
         "app.api.chat.gemini_integration.classify_intent_with_llm",
         AsyncMock(return_value="cs_tutor"),
-    ), patch(
-        "app.api.chat.gemini_integration.suggest_visualizations", suggest
     ), patch(
         "app.api.chat.scrape_leetcode_question", AsyncMock(return_value=SCRAPED)
     ), patch(
@@ -202,10 +191,14 @@ def test_guest_messages_are_not_persisted(client, leetcode_flow):
     for_user.assert_not_awaited()
 
 
-# --- Visualization suggestions ----------------------------------------------
+# --- The "Visualize this" button -------------------------------------------
 
 
-def test_an_answer_is_followed_by_suggestions(client, leetcode_flow):
+def answer_text(events):
+    return "".join(e.get("content", "") for e in events if e["type"] == "text")
+
+
+def test_a_marked_answer_ends_with_one_button(client, leetcode_flow):
     response = client.post(
         "/chat",
         json={"user_input": "two sum", "preferred_language": "python"},
@@ -213,20 +206,50 @@ def test_an_answer_is_followed_by_suggestions(client, leetcode_flow):
     )
 
     events = frames(response)
-    types = [e["type"] for e in events]
-    # Suggestions come after the answer text, never before or instead of it.
-    assert types[-1] == "suggestions"
-    assert "text" in types[: types.index("suggestions")]
-    suggestions = events[-1]
-    assert suggestions["data"][0]["title"] == "Hash map lookup for [2,7,11,15]"
-    assert suggestions["autoOpen"] is False
-
-    question, answer = leetcode_flow["suggest"].await_args.args
-    assert "Two Sum" in question
-    assert answer == "Here is the solution."
+    assert events[-1] == {
+        "type": "suggestions",
+        "data": [{"title": "Visualize this with an example", "kind": "context"}],
+        "autoOpen": False,
+    }
+    # The marker never reaches the screen, even split across chunks.
+    assert answer_text(events) == "Here is the solution.\n"
+    assert "<viz" not in response.text
 
 
-def test_asking_to_visualize_opens_the_first_suggestion(client, leetcode_flow):
+def test_the_tutor_is_told_about_the_marker(client, leetcode_flow):
+    client.post(
+        "/chat",
+        json={"user_input": "two sum", "preferred_language": "python"},
+        headers={"X-Session-ID": SESSION},
+    )
+    assert "<viz/>" in leetcode_flow["system_prompt"]
+
+
+def test_an_unmarked_answer_gets_no_button(client, leetcode_flow):
+    leetcode_flow["chunks"] = ["Recursion is a function calling itself."]
+    with patch(
+        "app.api.chat.gemini_integration.classify_intent_with_llm",
+        AsyncMock(return_value="cs_tutor"),
+    ), patch("app.api.chat.scrape_leetcode_question", AsyncMock(return_value=None)):
+        response = client.post(
+            "/chat", json={"user_input": "what is recursion?"}, headers={"X-Session-ID": SESSION}
+        )
+    assert "suggestions" not in [e["type"] for e in frames(response)]
+
+
+def test_answering_costs_no_extra_model_call(client, leetcode_flow):
+    """Nothing about the visualization is generated until the button is clicked."""
+    with patch("app.api.chat.gemini_integration.generate_scene", AsyncMock()) as scene:
+        client.post(
+            "/chat",
+            json={"user_input": "two sum", "preferred_language": "python"},
+            headers={"X-Session-ID": SESSION},
+        )
+    scene.assert_not_awaited()
+
+
+def test_asking_to_visualize_opens_the_button_even_without_the_marker(client, leetcode_flow):
+    leetcode_flow["chunks"] = ["Bubble sort swaps neighbours."]
     with patch(
         "app.api.chat.gemini_integration.classify_intent_with_llm",
         AsyncMock(return_value="visualization"),
@@ -240,37 +263,10 @@ def test_asking_to_visualize_opens_the_first_suggestion(client, leetcode_flow):
     events = frames(response)
     assert events[-1]["type"] == "suggestions"
     assert events[-1]["autoOpen"] is True
-    # The answer is told a trace is coming, so it stays short.
     assert "visualization" in leetcode_flow["prompt"].lower()
 
 
-def test_no_suggestions_means_no_event(client, leetcode_flow):
-    leetcode_flow["suggest"].return_value = []
-    response = client.post(
-        "/chat",
-        json={"user_input": "two sum", "preferred_language": "python"},
-        headers={"X-Session-ID": SESSION},
-    )
-    assert "suggestions" not in [e["type"] for e in frames(response)]
-
-
-def test_general_chit_chat_is_not_offered_visualizations(client, leetcode_flow):
-    with patch(
-        "app.api.chat.gemini_integration.classify_intent_with_llm",
-        AsyncMock(return_value="general"),
-    ), patch("app.api.chat.scrape_leetcode_question", AsyncMock(return_value=None)):
-        response = client.post(
-            "/chat", json={"user_input": "hello there"}, headers={"X-Session-ID": SESSION}
-        )
-
-    assert "suggestions" not in [e["type"] for e in frames(response)]
-    leetcode_flow["suggest"].assert_not_awaited()
-
-
-def test_suggestions_are_stored_with_the_signed_in_users_message(
-    client, leetcode_flow, as_user, alice
-):
-    """So the chips come back when the conversation is reopened."""
+def test_the_stored_answer_has_no_marker_and_keeps_the_button(client, leetcode_flow, as_user, alice):
     as_user(alice)
     db = AsyncMock()
     db.ensure_session_owned.return_value = True
@@ -283,8 +279,22 @@ def test_suggestions_are_stored_with_the_signed_in_users_message(
         )
 
     bot_rows = [c.kwargs for c in db.store_message.await_args_list if c.kwargs["sender_type"] == "bot"]
-    assert bot_rows[-1]["content"] == "Here is the solution."
-    assert bot_rows[-1]["metadata"]["suggestions"][0]["kind"] == "trace"
+    assert bot_rows[-1]["content"] == "Here is the solution.\n"
+    assert bot_rows[-1]["metadata"]["suggestions"][0]["kind"] == "context"
+
+
+def test_general_chit_chat_gets_no_button(client, leetcode_flow):
+    leetcode_flow["chunks"] = ["Hi! <viz/>"]  # even if the model misbehaves
+    with patch(
+        "app.api.chat.gemini_integration.classify_intent_with_llm",
+        AsyncMock(return_value="general"),
+    ), patch("app.api.chat.scrape_leetcode_question", AsyncMock(return_value=None)):
+        response = client.post(
+            "/chat", json={"user_input": "hello there"}, headers={"X-Session-ID": SESSION}
+        )
+    events = frames(response)
+    assert answer_text(events) == "Hi! "
+    assert "<viz" not in response.text
 
 
 # --- The "which language?" turn ----------------------------------------------
@@ -347,35 +357,47 @@ SCENE = Scene.model_validate({
     }],
 })
 
-VISUALIZE_BODY = {
-    "trace": SUGGESTION.trace.model_dump(),
-    "context": "Q: two sum\nA: ```java\nint[] twoSum(...)\n```",
-}
+CONTEXT = "Question: two sum\n\nAnswer: ```java\nint[] twoSum(...)\n```"
 
 
 @pytest.fixture
 def scene_generator():
     _SCENE_CACHE.clear()
-    generate = AsyncMock(return_value=SCENE)
+    generate = AsyncMock(return_value=SceneResult(feasible=True, scene=SCENE))
     with patch("app.api.chat.gemini_integration.generate_scene", generate):
         yield generate
     _SCENE_CACHE.clear()
 
 
-def test_visualize_returns_a_scene(client, scene_generator):
-    response = client.post("/chat/visualize", json=VISUALIZE_BODY)
+def test_visualize_needs_only_the_conversation(client, scene_generator):
+    response = client.post("/chat/visualize", json={"context": CONTEXT})
 
     assert response.status_code == 200
-    assert response.json()["scene"]["steps"][0]["title"] == "Look at 2"
-    trace, context, language = scene_generator.await_args.args
-    assert trace.problem == "Two Sum"
-    # The scene traces code in the language the conversation used.
+    body = response.json()
+    assert body["feasible"] is True
+    assert body["scene"]["steps"][0]["title"] == "Look at 2"
+    context, trace, language = scene_generator.await_args.args
+    assert context == CONTEXT and trace is None
+    # The trace is written in the language the conversation used.
     assert language == "java"
 
 
-def test_visualize_caches_by_request(client, scene_generator):
-    client.post("/chat/visualize", json=VISUALIZE_BODY)
-    again = client.post("/chat/visualize", json=VISUALIZE_BODY)
+def test_visualize_still_accepts_a_saved_specific_trace(client, scene_generator):
+    trace = {"problem": "Two Sum", "input": "[2,7]", "approach": "hash map"}
+    response = client.post("/chat/visualize", json={"context": CONTEXT, "trace": trace})
+    assert response.status_code == 200
+    assert scene_generator.await_args.args[1].problem == "Two Sum"
+
+
+def test_a_decline_is_returned_as_is(client, scene_generator):
+    scene_generator.return_value = SceneResult(feasible=False, reason="This is a proof, not a process.")
+    body = client.post("/chat/visualize", json={"context": CONTEXT}).json()
+    assert body == {"feasible": False, "reason": "This is a proof, not a process."}
+
+
+def test_visualize_caches_by_conversation(client, scene_generator):
+    client.post("/chat/visualize", json={"context": CONTEXT})
+    again = client.post("/chat/visualize", json={"context": CONTEXT})
 
     assert again.status_code == 200
     scene_generator.assert_awaited_once()
@@ -384,13 +406,13 @@ def test_visualize_caches_by_request(client, scene_generator):
 def test_visualize_reports_a_generation_failure_as_502(client, scene_generator):
     scene_generator.side_effect = GenerationError("Couldn't build a valid visualization (x).")
 
-    response = client.post("/chat/visualize", json=VISUALIZE_BODY)
+    response = client.post("/chat/visualize", json={"context": CONTEXT})
 
     assert response.status_code == 502
     assert "valid visualization" in response.json()["detail"]
 
 
-def test_visualize_rejects_a_malformed_body(client, scene_generator):
-    response = client.post("/chat/visualize", json={"trace": {"problem": "x"}})
-    assert response.status_code == 422
+def test_visualize_rejects_a_missing_context(client, scene_generator):
+    assert client.post("/chat/visualize", json={}).status_code == 422
+    assert client.post("/chat/visualize", json={"context": ""}).status_code == 422
     scene_generator.assert_not_awaited()

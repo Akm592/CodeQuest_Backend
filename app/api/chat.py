@@ -150,12 +150,13 @@ async def _stream_answer(
     yield "done", shown
 
 
-def _visualize_button(offer: bool, auto_open: bool) -> List[Dict[str, Any]]:
+def _visualize_button(offer: bool) -> List[Dict[str, Any]]:
     """Return the single "Visualize this with an example" button, if the answer earns one.
 
     No model call happens here: whether to offer it was decided by the answer
     itself (the marker), and nothing about the visualization is generated
-    until it is clicked.
+    until it is clicked. The answer is the only judge: if it decided the topic
+    can't be traced, there is no button, whatever the user asked.
     """
     return [CONTEXT_SUGGESTION.model_dump(exclude_none=True)] if offer else []
 
@@ -237,9 +238,10 @@ async def _stream_solution(
     _clear_pending(chat_session)
     chat_session.add_message("bot", full_output)
 
-    # Explicitly asked to visualize: offer (and open) it even if the answer
-    # forgot the marker. A solution always has something to trace.
-    suggestions = _visualize_button(marker.found or visualize, visualize)
+    # Only the answer's own judgement (the marker) earns a button, even when the
+    # user asked to visualize: a button that opens onto "this can't be shown"
+    # is worse than no button.
+    suggestions = _visualize_button(marker.found)
     if suggestions:
         yield _sse({"type": "suggestions", "data": suggestions, "autoOpen": visualize})
 
@@ -365,10 +367,12 @@ async def stream_response(
         query = user_input
         if wants_visualization:
             query = (
-                f"{user_input}\n\n(The user asked for a visualization. An animated "
-                "step-by-step trace will be shown right below your answer, so keep the "
-                "explanation concise: the idea, the key steps, and the complexity. Do "
-                "not draw ASCII diagrams or ask whether they want a dry run.)"
+                f"{user_input}\n\n(The user asked for a visualization. If this can be "
+                "traced faithfully step by step on one small example, keep the explanation "
+                "concise (the idea, the key steps, the complexity), skip ASCII diagrams, "
+                "and end with the marker: the app shows the animation below your answer. "
+                "If it can't, explain the topic normally, say in one sentence why it "
+                "doesn't suit a step-by-step animation, and do not add the marker.)"
             )
 
         marker = VizTagFilter()
@@ -384,7 +388,7 @@ async def stream_response(
 
         chat_session.add_message("bot", bot_text)
 
-        suggestions = _visualize_button(marker.found or wants_visualization, wants_visualization)
+        suggestions = _visualize_button(marker.found)
         if suggestions:
             yield _sse({"type": "suggestions", "data": suggestions, "autoOpen": wants_visualization})
 

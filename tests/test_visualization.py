@@ -71,3 +71,13 @@ def test_an_unsupported_preferred_language_is_dropped():
 
 def test_a_supported_preferred_language_is_normalised():
     assert ChatRequest(user_input="hi", preferred_language="  Java ").preferred_language == "java"
+
+
+def test_the_marker_rule_excludes_what_cannot_be_traced():
+    """The button should never lead to "this can't be shown"."""
+    from app.llm.prompts import CS_TUTOR_PROMPT
+
+    rule = " ".join(CS_TUTOR_PROMPT.split("### Visualization marker", 1)[1].split())
+    for excluded in ("halting problem", "proofs", "system design", "definitions"):
+        assert excluded in rule
+    assert "When in doubt" in rule

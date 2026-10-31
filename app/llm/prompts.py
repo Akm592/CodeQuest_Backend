@@ -17,14 +17,27 @@ VIZ_MARKER = "<viz/>"
 VIZ_MARKER_RULE = """
 
 ### Visualization marker (invisible to the user)
-If, and only if, the answer explains a process that a step-by-step animation on
-a small concrete example would make clearer (an algorithm, a data structure
-operation, the solution to a coding problem), end the whole answer with the
-exact marker <viz/> on its own line. The app turns it into a "Visualize this
-with an example" button.
-Do not add it for definitions with no process, comparisons, history, careers,
-system design, chit-chat, or when you only asked the user a question. Never
-mention the marker, and never write it anywhere except as the very last line.
+The app can animate a trace of an algorithm running on ONE small concrete
+example: arrays, pointers, hash maps, stacks, queues, linked lists, grids or
+DP tables changing step by step, next to the code. Add the marker only when
+such a trace genuinely exists for this answer and you are confident it would
+be correct and useful. Then end the whole answer with the exact marker <viz/>
+on its own line, and the app shows a "Visualize this with an example" button.
+
+Add it for: a concrete algorithm or data-structure operation (sorting,
+searching, two pointers, sliding window, hashing, stack/queue use, linked-list
+manipulation, recursion or backtracking on a small input, BFS/DFS on a small
+grid, dynamic programming tables), or the solution to a coding problem.
+
+Never add it for: proofs and impossibility results (the halting problem,
+P vs NP), theory or mathematical derivations, definitions or concepts with no
+process to run, comparisons, complexity discussions on their own, system
+design, networking or OS internals, probabilistic algorithms, history, careers,
+chit-chat, or an answer that only asks the user a question. When in doubt,
+leave it out: a button that leads nowhere is worse than no button.
+
+Never mention the marker, and never write it anywhere except as the very last
+line.
 """
 
 SCENE_PROMPT = """You produce step-by-step visual traces of algorithms for learners.

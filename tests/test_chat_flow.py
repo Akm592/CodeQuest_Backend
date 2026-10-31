@@ -248,22 +248,39 @@ def test_answering_costs_no_extra_model_call(client, leetcode_flow):
     scene.assert_not_awaited()
 
 
-def test_asking_to_visualize_opens_the_button_even_without_the_marker(client, leetcode_flow):
-    leetcode_flow["chunks"] = ["Bubble sort swaps neighbours."]
+def visualize_request(client, chunks, leetcode_flow):
+    leetcode_flow["chunks"] = chunks
     with patch(
         "app.api.chat.gemini_integration.classify_intent_with_llm",
         AsyncMock(return_value="visualization"),
     ), patch("app.api.chat.scrape_leetcode_question", AsyncMock(return_value=None)):
-        response = client.post(
+        return frames(client.post(
             "/chat",
             json={"user_input": "visualize bubble sort on [5,1,4]"},
             headers={"X-Session-ID": SESSION},
-        )
+        ))
 
-    events = frames(response)
+
+def test_asking_to_visualize_opens_the_button_when_the_answer_earns_it(client, leetcode_flow):
+    events = visualize_request(client, ["Bubble sort swaps neighbours.\n<viz/>"], leetcode_flow)
+
     assert events[-1]["type"] == "suggestions"
     assert events[-1]["autoOpen"] is True
     assert "visualization" in leetcode_flow["prompt"].lower()
+
+
+def test_asking_to_visualize_the_unvisualizable_gets_a_plain_answer(client, leetcode_flow):
+    """Answer plainly, with no button, when the answer says it can't be traced.
+
+    A button that opens onto "can't be shown" is bad UX, so an explicit
+    request no longer forces one.
+    """
+    events = visualize_request(
+        client, ["The halting problem is a proof, so there is nothing to step through."], leetcode_flow
+    )
+
+    assert "suggestions" not in [e["type"] for e in events]
+    assert "do not add the marker" in leetcode_flow["prompt"]
 
 
 def test_the_stored_answer_has_no_marker_and_keeps_the_button(client, leetcode_flow, as_user, alice):

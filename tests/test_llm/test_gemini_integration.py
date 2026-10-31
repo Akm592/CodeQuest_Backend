@@ -178,3 +178,65 @@ async def test_an_unavailable_model_is_reported(mock_genai_client):
 
     with pytest.raises(GenerationError, match="unavailable"):
         await generate_scene(CONTEXT)
+
+
+# --- Fallbacks when a way of asking is refused -------------------------------
+#
+# Production showed "The visualization service is unavailable right now" on
+# every click: the API refused the structured-output request outright. These
+# pin down the fallbacks that replaced giving up.
+
+
+@pytest.mark.asyncio
+async def test_a_refused_schema_falls_back_to_plain_json(mock_genai_client):
+    mock_genai_client.aio.models.generate_content.side_effect = [
+        RuntimeError("400 INVALID_ARGUMENT: schema produces too many states"),
+        response(feasible()),
+    ]
+
+    result = await generate_scene(CONTEXT)
+
+    assert result.feasible
+    second = mock_genai_client.aio.models.generate_content.call_args_list[1].kwargs
+    assert second["model"] == gemini_integration.SCENE_MODEL
+    assert second["config"].response_schema is None
+    assert "JSON Schema" in second["config"].system_instruction
+
+
+@pytest.mark.asyncio
+async def test_an_unavailable_scene_model_falls_back_to_the_answer_model(mock_genai_client):
+    mock_genai_client.aio.models.generate_content.side_effect = [
+        RuntimeError("404 model not found"),
+        RuntimeError("404 model not found"),
+        response(feasible()),
+    ]
+
+    result = await generate_scene(CONTEXT)
+
+    assert result.feasible
+    third = mock_genai_client.aio.models.generate_content.call_args_list[2].kwargs
+    assert third["model"] == gemini_integration.DEFAULT_MODEL
+
+
+@pytest.mark.asyncio
+async def test_only_when_every_way_is_refused_is_it_unavailable(mock_genai_client):
+    mock_genai_client.aio.models.generate_content.side_effect = RuntimeError("403")
+
+    with pytest.raises(GenerationError, match="unavailable"):
+        await generate_scene(CONTEXT)
+    assert mock_genai_client.aio.models.generate_content.await_count == 3
+
+
+@pytest.mark.asyncio
+async def test_plain_json_wrapped_in_a_code_fence_is_accepted(mock_genai_client):
+    mock_genai_client.aio.models.generate_content.side_effect = [
+        RuntimeError("400 schema"),
+        response("```json\n" + feasible() + "\n```"),
+    ]
+    assert (await generate_scene(CONTEXT)).feasible
+
+
+def test_the_fallback_order_has_no_duplicates_when_models_match(monkeypatch):
+    monkeypatch.setattr(gemini_integration, "SCENE_MODEL", gemini_integration.DEFAULT_MODEL)
+    attempts = gemini_integration._scene_attempts()
+    assert attempts == [(gemini_integration.DEFAULT_MODEL, True), (gemini_integration.DEFAULT_MODEL, False)]

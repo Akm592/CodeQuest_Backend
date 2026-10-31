@@ -1,5 +1,6 @@
+import json
 import time
-from typing import AsyncGenerator, Dict, List, Optional
+from typing import AsyncGenerator, Dict, List, Optional, Tuple
 
 from google import genai
 from google.genai import types
@@ -96,6 +97,52 @@ def _scene_request_text(context: str, trace: Optional[TraceRequest]) -> str:
     return text
 
 
+# The JSON Schema the plain-JSON fallback asks for in words. Built once.
+_SCENE_JSON_SCHEMA = json.dumps(SceneResult.model_json_schema(), separators=(",", ":"))
+
+
+def _scene_attempts() -> List[Tuple[str, bool]]:
+    """(model, structured) in the order to try them, without duplicates.
+
+    Structured output (``response_schema``) constrains the model best, but the
+    API refuses a schema it considers too large or too deeply nested, and the
+    scene model may not be enabled for every key. Either failure used to end
+    the request with "unavailable". Each fallback drops one of those risks:
+    plain JSON mode with the schema in the instructions, then the answer model,
+    which the chat already proves works with this key.
+    """
+    attempts = [(SCENE_MODEL, True), (SCENE_MODEL, False), (DEFAULT_MODEL, False)]
+    seen, ordered = set(), []
+    for attempt in attempts:
+        if attempt not in seen:
+            seen.add(attempt)
+            ordered.append(attempt)
+    return ordered
+
+
+def _scene_config(language: str, structured: bool) -> types.GenerateContentConfig:
+    instruction = SCENE_PROMPT.replace("{language}", language)
+    if structured:
+        return types.GenerateContentConfig(
+            temperature=0.3,
+            max_output_tokens=16000,
+            system_instruction=instruction,
+            response_mime_type="application/json",
+            response_schema=SceneResult,
+        )
+    return types.GenerateContentConfig(
+        temperature=0.3,
+        max_output_tokens=16000,
+        system_instruction=(
+            instruction
+            + "\n\nReturn ONLY a JSON object matching this JSON Schema "
+            + "(no markdown, no commentary):\n"
+            + _SCENE_JSON_SCHEMA
+        ),
+        response_mime_type="application/json",
+    )
+
+
 async def generate_scene(
     context: str, trace: Optional[TraceRequest] = None, language: str = "python"
 ) -> SceneResult:
@@ -106,54 +153,71 @@ async def generate_scene(
     (``feasible: false``) rather than invent an example the problem doesn't
     support. Small inconsistencies are repaired by the ``Scene`` validator;
     only problems it can't repair are sent back once with the error.
+
+    If a call is *refused* (schema rejected, model unavailable), the next way
+    of asking is tried; see _scene_attempts.
     """
-    config = types.GenerateContentConfig(
-        temperature=0.3,
-        max_output_tokens=16000,
-        system_instruction=SCENE_PROMPT.replace("{language}", language),
-        response_mime_type="application/json",
-        response_schema=SceneResult,
-    )
-    contents: List[types.Content] = [
-        types.Content(role="user", parts=[types.Part(text=_scene_request_text(context, trace))])
-    ]
+    request = types.Content(role="user", parts=[types.Part(text=_scene_request_text(context, trace))])
+    refusals: List[str] = []
+    last_invalid: Optional[str] = None
 
-    last_error = "unknown error"
-    for attempt in range(2):
-        try:
-            response = await client.aio.models.generate_content(
-                model=SCENE_MODEL, contents=contents, config=config
-            )
-        except Exception as e:
-            logger.error(f"Scene generation call failed: {e}")
-            raise GenerationError("The visualization service is unavailable right now.") from e
+    for model, structured in _scene_attempts():
+        mode = f"{model} ({'schema' if structured else 'json'})"
+        config = _scene_config(language, structured)
+        contents: List[types.Content] = [request]
 
-        raw = response.text or ""
-        try:
-            # Validate from the raw JSON rather than trusting `response.parsed`:
-            # the SDK skips Pydantic validators when parsing fails, and the
-            # repairs live in those validators.
-            result = SceneResult.model_validate_json(raw)
-        except ValidationError as e:
-            last_error = "; ".join(err["msg"] for err in e.errors()[:5])
-            logger.info(f"Scene attempt {attempt + 1} invalid: {last_error}")
-            contents += [
-                types.Content(role="model", parts=[types.Part(text=raw[:20000])]),
-                types.Content(
-                    role="user",
-                    parts=[types.Part(text=(
-                        f"That result is invalid: {last_error}. "
-                        "Return the corrected complete result."
-                    ))],
-                ),
-            ]
-            continue
+        for repair in range(2):
+            try:
+                response = await client.aio.models.generate_content(
+                    model=model, contents=contents, config=config
+                )
+            except Exception as e:
+                refusals.append(f"{mode}: {e}")
+                logger.error(f"Scene generation call failed with {mode}: {e}")
+                break  # this way of asking is refused; try the next one
 
-        if result.scene is not None and result.scene._repairs:
-            logger.info(f"Scene repaired: {'; '.join(result.scene._repairs)}")
-        return result
+            raw = response.text or ""
+            try:
+                # Validate from the raw JSON rather than trusting
+                # `response.parsed`: the SDK skips Pydantic validators when
+                # parsing fails, and the repairs live in those validators.
+                result = SceneResult.model_validate_json(_strip_fences(raw))
+            except ValidationError as e:
+                last_invalid = "; ".join(err["msg"] for err in e.errors()[:5])
+                logger.info(f"Scene from {mode}, attempt {repair + 1}, invalid: {last_invalid}")
+                contents = [
+                    request,
+                    types.Content(role="model", parts=[types.Part(text=raw[:20000])]),
+                    types.Content(
+                        role="user",
+                        parts=[types.Part(text=(
+                            f"That result is invalid: {last_invalid}. "
+                            "Return the corrected complete result."
+                        ))],
+                    ),
+                ]
+                continue
 
-    raise GenerationError(f"Couldn't build a valid visualization ({last_error}).")
+            if result.scene is not None and result.scene._repairs:
+                logger.info(f"Scene from {mode} repaired: {'; '.join(result.scene._repairs)}")
+            logger.info(f"Scene generated with {mode}.")
+            return result
+        else:
+            # Both tries answered but neither was usable: asking another way
+            # won't help a model that understood the request.
+            raise GenerationError(f"Couldn't build a valid visualization ({last_invalid}).")
+
+    logger.error(f"Every way of generating a scene was refused: {' | '.join(refusals)}")
+    raise GenerationError("The visualization service is unavailable right now.")
+
+
+def _strip_fences(raw: str) -> str:
+    """Drop a ```json fence, which plain JSON mode occasionally adds anyway."""
+    text = raw.strip()
+    if text.startswith("```"):
+        text = text.split("\n", 1)[1] if "\n" in text else ""
+        text = text.rsplit("```", 1)[0]
+    return text
 
 
 async def classify_intent_with_llm(user_query: str) -> str:

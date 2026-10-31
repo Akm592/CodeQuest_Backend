@@ -2,6 +2,7 @@
 import ast
 import json
 import re
+import time
 import unicodedata
 from typing import Any, Dict, List, Optional
 
@@ -15,40 +16,62 @@ LEETCODE_ALL_PROBLEMS_URL = "https://leetcode.com/api/problems/all/"
 
 # Cache for problems list to avoid repeated fetching
 _problems_cache: Optional[List[Dict[str, Any]]] = None
+# monotonic time before which a failed download is not retried.
+_retry_after = 0.0
+
+# The list is ~1 MB. A shorter timeout bounds how long one unlucky message can
+# wait on it; the backoff stops every later message from waiting again.
+PROBLEM_LIST_TIMEOUT_S = 10.0
+FAILURE_BACKOFF_S = 600.0
+
 
 async def _fetch_all_problems() -> Optional[List[Dict[str, Any]]]:
-    """Fetch and cache the list of all LeetCode problems."""
-    global _problems_cache
-    if _problems_cache:
+    """Fetch and cache the list of all LeetCode problems.
+
+    A failed download used to set the cache to ``[]``, which the cache check
+    (``if _problems_cache:``) reads as "not cached". So once LeetCode refused
+    the server once, *every* later coding question retried the 30-second
+    download before it could even start answering. Failures are now
+    remembered for FAILURE_BACKOFF_S.
+    """
+    global _problems_cache, _retry_after
+    if _problems_cache is not None:
         return _problems_cache
+    if time.monotonic() < _retry_after:
+        return None
 
     logger.info("Fetching all LeetCode problems list...")
+    started = time.perf_counter()
     try:
-        # Increased timeout for potentially large response
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with httpx.AsyncClient(timeout=PROBLEM_LIST_TIMEOUT_S) as client:
             response = await client.get(LEETCODE_ALL_PROBLEMS_URL)
-            response.raise_for_status() # Raise exception for bad status codes (4xx or 5xx)
+            response.raise_for_status()
             data = response.json()
-            if "stat_status_pairs" in data:
-                _problems_cache = data["stat_status_pairs"]
-                logger.info(f"Successfully fetched and cached {len(_problems_cache)} LeetCode problems.")
-                return _problems_cache
-            else:
-                logger.error("Fetched LeetCode problems data missing 'stat_status_pairs'.")
-                _problems_cache = [] # Set to empty list to avoid retrying immediately
-                return None
-    except httpx.HTTPStatusError as e:
-        logger.error(f"HTTP status error fetching LeetCode problems: {e.response.status_code} - {e.request.url}")
-        _problems_cache = []
-        return None
-    except httpx.RequestError as e:
-        logger.error(f"HTTP request error fetching LeetCode problems: {e}")
-        _problems_cache = []
-        return None
+        problems = data.get("stat_status_pairs") if isinstance(data, dict) else None
+        if not problems:
+            raise ValueError("response has no 'stat_status_pairs'")
+        _problems_cache = problems
+        logger.info(
+            f"Cached {len(problems)} LeetCode problems in {time.perf_counter() - started:.1f}s."
+        )
+        return problems
     except Exception as e:
-        logger.error(f"Unexpected error fetching LeetCode problems: {e}", exc_info=True)
-        _problems_cache = []
+        _retry_after = time.monotonic() + FAILURE_BACKOFF_S
+        logger.error(
+            f"Could not fetch the LeetCode problem list ({e!r}) after "
+            f"{time.perf_counter() - started:.1f}s; not retrying for {FAILURE_BACKOFF_S:.0f}s."
+        )
         return None
+
+
+async def warm_problem_list() -> None:
+    """Load the problem list in the background at startup.
+
+    Otherwise the first coding question after every restart (and the free
+    tier restarts whenever it idles) pays for the download.
+    """
+    await _fetch_all_problems()
+
 
 def normalize_text(text: str) -> str:
     """Normalize text by lowercasing, removing accents, and extra whitespace."""

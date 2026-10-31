@@ -433,3 +433,36 @@ def test_visualize_rejects_a_missing_context(client, scene_generator):
     assert client.post("/chat/visualize", json={}).status_code == 422
     assert client.post("/chat/visualize", json={"context": ""}).status_code == 422
     scene_generator.assert_not_awaited()
+
+
+# --- Response time -----------------------------------------------------------
+
+
+def test_intent_and_leetcode_lookup_run_side_by_side(client, leetcode_flow):
+    """Two independent round trips used to run one after the other.
+
+    The fake classifier only returns once the lookup has *started*, so if the
+    calls were still sequential it would time out instead.
+    """
+    import asyncio
+
+    lookup_started = asyncio.Event()
+
+    async def classify(_):
+        await asyncio.wait_for(lookup_started.wait(), timeout=2)
+        return "cs_tutor"
+
+    async def lookup(_):
+        lookup_started.set()
+        return None
+
+    with patch("app.api.chat.gemini_integration.classify_intent_with_llm", classify), patch(
+        "app.api.chat.scrape_leetcode_question", lookup
+    ):
+        response = client.post(
+            "/chat", json={"user_input": "what is recursion?"}, headers={"X-Session-ID": SESSION}
+        )
+
+    events = frames(response)
+    assert "error" not in [e["type"] for e in events]
+    assert answer_text(events) == "Here is the solution.\n"

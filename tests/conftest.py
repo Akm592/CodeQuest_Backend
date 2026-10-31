@@ -24,6 +24,7 @@ os.environ.setdefault("GUEST_RATE_LIMIT", "10")
 os.environ.setdefault("TRUSTED_PROXY_HOPS", "1")
 os.environ.setdefault("LOG_LEVEL", "WARNING")
 os.environ.setdefault("APP_LOG_FILE", "")
+os.environ.setdefault("WARM_LEETCODE_CACHE", "false")
 
 import pytest  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402

@@ -7,9 +7,11 @@ verified by ``app.core.auth`` and every database operation runs as them, so row
 level security applies.
 """
 
+import asyncio
 import hashlib
 import json
 import re
+import time
 import uuid
 from collections import OrderedDict
 from typing import Any, AsyncGenerator, Dict, List, Optional
@@ -138,11 +140,19 @@ async def _stream_answer(
     sent back to the model.
     """
     shown = ""
+    started = time.perf_counter()
+    first_token: Optional[float] = None
     async for chunk in gemini_integration.stream_chat_response(query, system_prompt, chat_history):
+        if first_token is None:
+            first_token = time.perf_counter() - started
         text = marker.feed(chunk)
         if text:
             shown += text
             yield "event", _sse({"type": "text", "content": text})
+    logger.info(
+        f"Answer: first token after {first_token or 0:.2f}s, "
+        f"{len(shown)} chars in {time.perf_counter() - started:.2f}s"
+    )
     rest = marker.finish()
     if rest:
         shown += rest
@@ -315,14 +325,26 @@ async def stream_response(
             return
 
         # --- A fresh turn ---------------------------------------------------
-        intent = await gemini_integration.classify_intent_with_llm(user_input)
+        # The intent call and the LeetCode lookup are independent network
+        # round trips, so they run side by side instead of one after the
+        # other. The lookup's result is simply ignored if the intent turns out
+        # not to need it.
+        started = time.perf_counter()
+        intent, looked_up = await asyncio.gather(
+            gemini_integration.classify_intent_with_llm(user_input),
+            scrape_leetcode_question(user_input),
+        )
         wants_visualization = intent == "visualization"
 
         scraped = None
         if intent in ("cs_tutor", "visualization") or re.search(
             r"leetcode\.com/problems/", user_input.lower()
         ) or re.match(r"^\s*\d+\s*[.]?", user_input):
-            scraped = await scrape_leetcode_question(user_input)
+            scraped = looked_up
+        logger.info(
+            f"[{session_id}] intent={intent} leetcode={bool(scraped)} "
+            f"routing took {time.perf_counter() - started:.2f}s"
+        )
 
         if scraped:
             language = preferred_language or detect_language(user_input)

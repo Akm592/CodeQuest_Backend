@@ -44,6 +44,9 @@ class Settings:
         # they can afford a stronger model than every answer can. The lighter
         # model slipped on cross-references in bigger traces.
         self.GEMINI_SCENE_MODEL: str = os.getenv("GEMINI_SCENE_MODEL", "gemini-2.5-flash")
+        # Download the LeetCode problem list at startup, in the background, so
+        # the first coding question after a restart doesn't wait on it.
+        self.WARM_LEETCODE_CACHE: bool = os.getenv("WARM_LEETCODE_CACHE", "true").lower() == "true"
         self.SUPABASE_URL: str = os.getenv("SUPABASE_URL", "")
         self.SUPABASE_ANON_KEY: str = os.getenv("SUPABASE_ANON_KEY", "")
 

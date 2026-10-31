@@ -7,9 +7,11 @@ verified by ``app.core.auth`` and every database operation runs as them, so row
 level security applies.
 """
 
+import hashlib
 import json
 import re
 import uuid
+from collections import OrderedDict
 from typing import Any, AsyncGenerator, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -26,8 +28,8 @@ from app.schemas.chat_schemas import (
     SUPPORTED_LANGUAGES,
     ChatRequest,
     PendingContext,
-    validate_visualization,
 )
+from app.schemas.visualization_schemas import Suggestion, VisualizeRequest
 from app.scrapers.leetcode_scraper import fetch_leetcode_question, scrape_leetcode_question
 
 router = APIRouter()
@@ -94,9 +96,16 @@ def _examples_text(scraped: Dict[str, Any]) -> str:
     return "\n\nWorked examples from the problem statement:\n" + "\n".join(lines)
 
 
-def _solution_prompt(scraped: Dict[str, Any], language: str, visualize: bool) -> str:
-    """Build the LeetCode solution prompt."""
-    prompt = (
+def _solution_prompt(scraped: Dict[str, Any], language: str) -> str:
+    """Build the LeetCode solution prompt.
+
+    It used to append "also output visualization JSON in a ```json block" when
+    a visualization was wanted. That JSON was then regex-extracted from the
+    answer, failed to parse whenever it nested, and was left in the chat text
+    either way. Visualizations are now offered as suggestions after the answer
+    and generated separately against a schema.
+    """
+    return (
         f"Here is the LeetCode problem description:\n\n"
         f"```\n{_problem_text(scraped)}\n```"
         f"{_examples_text(scraped)}\n\n"
@@ -112,41 +121,29 @@ def _solution_prompt(scraped: Dict[str, Any], language: str, visualize: bool) ->
         f"4.  **Edge Cases/Considerations:** Mention any important edge cases or constraints.\n\n"
         f"Ensure the code is correct, runnable, and follows {language} best practices."
     )
-    if visualize:
-        prompt += (
-            "\n\n**Additionally:** Based on the optimal algorithm discussed, generate the "
-            "JSON data needed to visualize its key steps. Output this JSON *after* the "
-            "textual explanation, enclosed in ```json ... ``` blocks, using one of the "
-            "standard visualization types."
-        )
-    return prompt
 
 
-def _extract_visualization(text: str) -> Optional[Dict[str, Any]]:
-    """Pull a visualization payload out of an LLM response, if there is a valid one."""
-    match = re.search(
-        r"```json\s*([\s\S]*?)\s*```|(?<!`)(\{\s*\"visualizationType\".*?\})(?!`)",
-        text,
-        re.DOTALL | re.IGNORECASE,
-    )
-    if not match:
-        return None
+async def _suggest(question: str, answer: str, auto_open: bool = False):
+    """Offer visualizations for an answer.
 
-    raw = next((group for group in match.groups() if group is not None), None)
-    if not raw:
-        return None
+    Yields the SSE event (if there is anything to offer) and finally the
+    suggestions as plain dicts, for storing with the message. Kept separate
+    from the answer stream so a failure here can never cost the user the
+    answer they already have.
+    """
+    suggestions: List[Suggestion] = []
+    if answer.strip():
+        suggestions = await gemini_integration.suggest_visualizations(question, answer)
+    data = [s.model_dump(exclude_none=True) for s in suggestions]
+    if data:
+        yield _sse({"type": "suggestions", "data": data, "autoOpen": auto_open})
+    yield data
 
-    try:
-        parsed = json.loads(raw.strip())
-    except json.JSONDecodeError as exc:
-        logger.info(f"Visualization JSON did not parse: {exc}")
-        return None
 
-    validated = validate_visualization(parsed)
-    if validated is None:
-        logger.info("Visualization payload failed validation; sending text only.")
-        return None
-    return validated
+def _suggestion_metadata(suggestions: List[Dict[str, Any]], auto_open: bool) -> Dict[str, Any]:
+    if not suggestions:
+        return {}
+    return {"suggestions": suggestions, "auto_open": auto_open}
 
 
 async def _persist(
@@ -204,37 +201,40 @@ async def _stream_solution(
     session_id: str,
     chat_session: ChatSession,
     db: Optional[SupabaseManager],
+    question: str,
 ) -> AsyncGenerator[str, None]:
-    """Generate and stream a LeetCode solution."""
+    """Generate and stream a LeetCode solution, then offer visualizations."""
     logger.info(f"[{session_id}] Generating solution in '{language}' (visualize={visualize}).")
 
     full_output = ""
     async for chunk in gemini_integration.stream_chat_response(
-        user_query=_solution_prompt(scraped, language, visualize),
+        user_query=_solution_prompt(scraped, language),
         system_prompt=CS_TUTOR_PROMPT,
         chat_history=[],
     ):
         full_output += chunk
         yield _sse({"type": "text", "content": chunk})
 
-    visualization = _extract_visualization(full_output) if visualize else None
-    text_part = full_output
-    if visualization is not None:
-        yield _sse({"type": "visualization", "data": visualization})
-
     _clear_pending(chat_session)
-    chat_session.add_message("bot", text_part)
+    chat_session.add_message("bot", full_output)
+
+    suggestions: List[Dict[str, Any]] = []
+    async for item in _suggest(f"LeetCode: {scraped.get('title', '')}\n{question}", full_output, visualize):
+        if isinstance(item, str):
+            yield item
+        else:
+            suggestions = item
+
     await _persist(
         db,
         session_id,
         "bot",
-        text_part,
+        full_output,
         intent="cs_tutor",
-        visualization_data=visualization,
         metadata={
             "response_type": "LLM_solution",
             "language": language,
-            "visualization_provided": bool(visualization),
+            **_suggestion_metadata(suggestions, visualize),
         },
     )
 
@@ -253,8 +253,21 @@ async def stream_response(
 
     try:
         # --- Answering the "which language?" question -----------------------
-        if pending is not None or chat_session.get_state("awaiting_language"):
-            language = (preferred_language or user_input.strip().lower()) or ""
+        awaiting = pending is not None or chat_session.get_state("awaiting_language")
+        answer_language = preferred_language or (
+            user_input.strip().lower()
+            if user_input.strip().lower() in SUPPORTED_LANGUAGES
+            else detect_language(user_input)
+        )
+        if awaiting and answer_language is None:
+            # The user moved on instead of naming a language. Previously the
+            # bot re-asked "which language?" for as long as the in-process
+            # flag stayed set, so any other question got the same reply.
+            _clear_pending(chat_session)
+            awaiting = False
+
+        if awaiting:
+            language = answer_language or ""
             visualize = bool(pending.visualize) if pending else bool(
                 chat_session.get_state("request_visualization", False)
             )
@@ -275,34 +288,8 @@ async def stream_response(
                 )
                 return
 
-            if language not in SUPPORTED_LANGUAGES:
-                detected = detect_language(language)
-                if detected is None:
-                    message = (
-                        "Which language would you like the solution in? "
-                        "For example: Python, Java, or C++."
-                    )
-                    yield _sse({"type": "text", "content": message})
-                    # Hand the context back so the next turn works even if this
-                    # instance is replaced in between.
-                    yield _sse({
-                        "type": "pending",
-                        "data": {
-                            "kind": "awaiting_language",
-                            "slug": scraped.get("slug", ""),
-                            "visualize": visualize,
-                        },
-                    })
-                    chat_session.add_message("bot", message)
-                    await _persist(
-                        db, session_id, "bot", message, intent="cs_tutor",
-                        metadata={"response_type": "clarification_retry"},
-                    )
-                    return
-                language = detected
-
             async for event in _stream_solution(
-                scraped, language, visualize, session_id, chat_session, db
+                scraped, language, visualize, session_id, chat_session, db, user_input
             ):
                 yield event
             return
@@ -322,7 +309,8 @@ async def stream_response(
             if language:
                 # Skip the clarification turn entirely.
                 async for event in _stream_solution(
-                    scraped, language, wants_visualization, session_id, chat_session, db
+                    scraped, language, wants_visualization, session_id, chat_session, db,
+                    user_input,
                 ):
                     yield event
                 return
@@ -353,38 +341,52 @@ async def stream_response(
             return
 
         # --- Not a LeetCode problem -----------------------------------------
-        bot_text = ""
-        visualization = None
-
-        if intent == "visualization":
-            raw = await gemini_integration.get_visualization_data(user_input)
-            visualization = validate_visualization(raw)
-            if visualization is not None:
-                yield _sse({"type": "visualization", "data": visualization})
-                bot_text = "Here's the visualization for your request."
-                yield _sse({"type": "text", "content": bot_text})
-            else:
-                bot_text = (
-                    "Sorry, I couldn't build a visualization for that. Try rephrasing, "
-                    "or ask for a supported type such as sorting, trees, graphs or arrays."
-                )
-                yield _sse({"type": "text", "content": bot_text})
-        else:
-            system_prompt = CS_TUTOR_PROMPT if intent == "cs_tutor" else GENERAL_PROMPT
-            async for chunk in gemini_integration.stream_chat_response(
-                user_input, system_prompt, chat_history
-            ):
-                bot_text += chunk
-                yield _sse({"type": "text", "content": chunk})
-
-        if bot_text:
-            chat_session.add_message("bot", bot_text)
-            await _persist(
-                db, session_id, "bot", bot_text, intent=intent,
-                visualization_data=visualization,
-                metadata={"response_type": "LLM_general"},
+        # An explicit "visualize X" request gets a normal (brief) explanation,
+        # and its first suggestion is opened straight away by the client.
+        system_prompt = GENERAL_PROMPT if intent == "general" else CS_TUTOR_PROMPT
+        query = user_input
+        if wants_visualization:
+            query = (
+                f"{user_input}\n\n(The user asked for a visualization. An animated "
+                "step-by-step trace will be shown right below your answer, so keep the "
+                "explanation concise: the idea, the key steps, and the complexity. Do "
+                "not draw ASCII diagrams or ask whether they want a dry run.)"
             )
 
+        bot_text = ""
+        async for chunk in gemini_integration.stream_chat_response(
+            query, system_prompt, chat_history
+        ):
+            bot_text += chunk
+            yield _sse({"type": "text", "content": chunk})
+
+        if not bot_text:
+            return
+
+        chat_session.add_message("bot", bot_text)
+
+        suggestions: List[Dict[str, Any]] = []
+        if intent != "general" or wants_visualization:
+            async for item in _suggest(user_input, bot_text, wants_visualization):
+                if isinstance(item, str):
+                    yield item
+                else:
+                    suggestions = item
+
+        await _persist(
+            db, session_id, "bot", bot_text, intent=intent,
+            metadata={
+                "response_type": "LLM_general",
+                **_suggestion_metadata(suggestions, wants_visualization),
+            },
+        )
+
+    except gemini_integration.GenerationError as exc:
+        logger.error(f"[{session_id}] Model failure: {exc}")
+        yield _sse({
+            "type": "error",
+            "content": "The AI model didn't respond. Please try again in a moment.",
+        })
     except Exception as exc:
         logger.error(f"[{session_id}] Unhandled error in stream_response: {exc}", exc_info=True)
         message = "Something went wrong while answering. Please try again."
@@ -428,6 +430,48 @@ async def scrape_leetcode_endpoint(request: Request):
             ),
         )
     return {"question_details": scraped}
+
+
+# Generated scenes, keyed by the request. Reopening a suggestion, or two people
+# clicking the same one, should not pay for generation twice.
+_SCENE_CACHE: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+SCENE_CACHE_SIZE = 200
+
+
+def _scene_cache_key(body: VisualizeRequest) -> str:
+    raw = json.dumps(
+        {"trace": body.trace.model_dump(), "context": body.context or ""}, sort_keys=True
+    )
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
+@router.post("/chat/visualize")
+async def visualize_endpoint(
+    body: VisualizeRequest,
+    request: Request,
+    user: Optional[AuthenticatedUser] = Depends(get_current_user),
+):
+    """Build the step-by-step scene for a suggestion the user clicked."""
+    key = _scene_cache_key(body)
+    cached = _SCENE_CACHE.get(key)
+    if cached is not None:
+        _SCENE_CACHE.move_to_end(key)
+        return {"scene": cached}
+
+    if user is None:
+        check_rate_limit(request)
+
+    language = detect_language(body.context or "") or "python"
+    try:
+        scene = await gemini_integration.generate_scene(body.trace, body.context, language)
+    except gemini_integration.GenerationError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+
+    data = scene.model_dump(exclude_none=True)
+    _SCENE_CACHE[key] = data
+    if len(_SCENE_CACHE) > SCENE_CACHE_SIZE:
+        _SCENE_CACHE.popitem(last=False)
+    return {"scene": data}
 
 
 @router.post("/chat")

@@ -1,257 +1,183 @@
+"""The Gemini wrapper, with the client mocked out."""
+
+import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from app.llm import gemini_integration
 from app.llm.gemini_integration import (
-    clean_json_response,
-    get_chat_response,
-    get_contextual_visualization_data,
-    get_visualization_data,
+    GenerationError,
+    generate_scene,
     stream_chat_response,
+    suggest_visualizations,
 )
-from app.llm.prompts import VISUALIZATION_PROMPT
+from app.schemas.visualization_schemas import Scene, SuggestionList, TraceRequest
 
+TRACE = TraceRequest(problem="Two Sum", input="nums=[2,7], target=9", approach="hash map")
 
-# Test for clean_json_response
-def test_clean_json_response():
-    assert clean_json_response("```json\n{\"key\": \"value\"}\n```") == '{\"key\": \"value\"}'
-    assert clean_json_response("```json\n{\"key\": \"value\"}\n```\n") == '{\"key\": \"value\"}'
-    assert clean_json_response("```json\n{\"key\": \"value\"}```") == '{\"key\": \"value\"}'
-    assert clean_json_response("{\"key\": \"value\"}") == '{\"key\": \"value\"}'
-    assert clean_json_response("  {\"key\": \"value\"}  ") == '{\"key\": \"value\"}'
-    assert clean_json_response("```json\n[1, 2, 3]\n```") == '[1, 2, 3]'
-    assert clean_json_response("""Some text before ```json
-{"key": "value"}
-``` some text after""") == '{"key": "value"}'
-    assert clean_json_response("No JSON here") == "No JSON here"
-    assert clean_json_response("") == ""
+VALID_SCENE = {
+    "title": "Two Sum",
+    "summary": "Look up each complement before storing the value.",
+    "structures": [{"id": "nums", "type": "array", "label": "nums"}],
+    "code": {"language": "python", "lines": ["for i, x in enumerate(nums):", "    ..."]},
+    "steps": [{
+        "title": "Look at 2",
+        "explanation": "9 - 2 = 7 has not been seen, so store 2.",
+        "code_line": 1,
+        "states": [{"structure": "nums", "items": ["2", "7"]}],
+    }],
+}
+
 
 @pytest.fixture(autouse=True)
 def mock_genai_client():
-    with patch('app.llm.gemini_integration.client') as mock_client:
+    with patch("app.llm.gemini_integration.client") as mock_client:
+        mock_client.aio.models.generate_content = AsyncMock()
         yield mock_client
 
-@pytest.mark.asyncio
-async def test_get_visualization_data_success(mock_genai_client):
-    mock_chat_session = AsyncMock()
-    mock_genai_client.aio.chats.create.return_value = mock_chat_session
-    mock_chat_session.send_message.return_value.text = '```json\n{\"type\": \"array\", \"data\": [1, 2, 3]}\n```'
 
-    user_query = "visualize array [1,2,3]"
-    result = await get_visualization_data(user_query)
+def response(text="", parsed=None):
+    r = MagicMock()
+    r.text = text
+    r.parsed = parsed
+    return r
 
-    mock_genai_client.aio.chats.create.assert_called_once()
-    mock_chat_session.send_message.assert_called_once_with(
-        VISUALIZATION_PROMPT + "\n\n" + user_query
-    )
-    assert result == {"type": "array", "data": [1, 2, 3]}
+
+# --- Streaming answers -------------------------------------------------------
+
 
 @pytest.mark.asyncio
-@pytest.mark.asyncio
-async def test_get_visualization_data_invalid_json(mock_genai_client):
-    mock_chat_session = AsyncMock()
-    mock_genai_client.aio.chats.create.return_value = mock_chat_session
-    mock_chat_session.send_message.return_value.text = "Invalid JSON response"
-
-    user_query = "visualize something"
-    result = await get_visualization_data(user_query)
-
-    assert result is None
-
-@pytest.mark.asyncio
-@pytest.mark.asyncio
-async def test_get_visualization_data_exception(mock_genai_client):
-    mock_genai_client.aio.chats.create.side_effect = Exception("API error")
-
-    user_query = "visualize something"
-    result = await get_visualization_data(user_query)
-
-    assert result is None
-
-@pytest.mark.asyncio
-@pytest.mark.asyncio
-async def test_get_chat_response_success(mock_genai_client):
-    mock_chat_session = AsyncMock()
-    mock_genai_client.aio.chats.create.return_value = mock_chat_session
-    mock_chat_session.send_message.return_value.text = "Hello from bot"
-
-    user_query = "Hi"
-    system_prompt = "You are a helpful assistant."
-    chat_history = []
-
-    result = await get_chat_response(user_query, system_prompt, chat_history)
-
-    mock_genai_client.aio.chats.create.assert_called_once()
-    mock_chat_session.send_message.assert_any_call(system_prompt)
-    mock_chat_session.send_message.assert_called_with(user_query)
-    assert result == "Hello from bot"
-
-@pytest.mark.asyncio
-@pytest.mark.asyncio
-async def test_get_chat_response_with_history(mock_genai_client):
-    mock_chat_session = AsyncMock()
-    mock_genai_client.aio.chats.create.return_value = mock_chat_session
-    mock_chat_session.send_message.return_value.text = "Bot response with history"
-
-    user_query = "What is Python?"
-    system_prompt = "You are a helpful assistant."
-    chat_history = [
-        {"role": "user", "content": "Hello"},
-        {"role": "model", "content": "Hi there!"},
-    ]
-
-    result = await get_chat_response(user_query, system_prompt, chat_history)
-
-    mock_genai_client.aio.chats.create.assert_called_once()
-    # Check if history was passed in create call
-    _, kwargs = mock_genai_client.aio.chats.create.call_args
-    assert len(kwargs['history']) == 2
-    assert kwargs['history'][0].role == 'user'
-    assert kwargs['history'][0].parts[0].text == 'Hello'
-
-    mock_chat_session.send_message.assert_any_call(system_prompt)
-    mock_chat_session.send_message.assert_any_call(user_query)
-    assert result == "Bot response with history"
-
-@pytest.mark.asyncio
-@pytest.mark.asyncio
-async def test_stream_chat_response_success(mock_genai_client):
-    # Mock the behavior: await generate_content_stream returns an async iterable
-    async def mock_iter():
+async def test_the_system_prompt_is_a_system_instruction_not_a_user_turn(mock_genai_client):
+    """It was sent as the first user message, which the model can argue with."""
+    async def chunks():
         yield MagicMock(text="chunk1")
         yield MagicMock(text="chunk2")
-        yield MagicMock(text="chunk3")
 
-    # Set as return_value of the AsyncMock.
-    # Calling the mock returns a coroutine (because it's AsyncMock child of MagicMock?)
-    # actually mock_genai_client.aio... is likely a MagicMock unless we specify.
-    # Let's forcibly make generate_content_stream an AsyncMock.
-    mock_genai_client.aio.models.generate_content_stream = AsyncMock(return_value=mock_iter())
+    mock_genai_client.aio.models.generate_content_stream = AsyncMock(return_value=chunks())
 
-    user_query = "Tell me a story"
-    system_prompt = "You are a storyteller."
-    chat_history = []
+    out = [c async for c in stream_chat_response("Tell me a story", "You are a storyteller.", [])]
 
-    chunks = [chunk async for chunk in stream_chat_response(user_query, system_prompt, chat_history)]
-
-    assert chunks == ["chunk1", "chunk2", "chunk3"]
-    mock_genai_client.aio.models.generate_content_stream.assert_called_once()
+    assert out == ["chunk1", "chunk2"]
     _, kwargs = mock_genai_client.aio.models.generate_content_stream.call_args
-    # Verify contents structure
-    contents = kwargs['contents']
-    assert len(contents) == 2
-    assert contents[0].role == 'user'
-    assert contents[0].parts[0].text == system_prompt
-    assert contents[1].role == 'user'
-    assert contents[1].parts[0].text == user_query
+    assert [c.parts[0].text for c in kwargs["contents"]] == ["Tell me a story"]
+    assert kwargs["config"].system_instruction == "You are a storyteller."
+
 
 @pytest.mark.asyncio
-@pytest.mark.asyncio
-async def test_stream_chat_response_with_history(mock_genai_client):
-    async def mock_iter():
-        yield MagicMock(text="history_chunk1")
-        yield MagicMock(text="history_chunk2")
+async def test_history_precedes_the_query(mock_genai_client):
+    async def chunks():
+        yield MagicMock(text="ok")
 
-    mock_genai_client.aio.models.generate_content_stream = AsyncMock(return_value=mock_iter())
-
-    user_query = "Continue the story"
-    system_prompt = "You are a storyteller."
-    chat_history = [
+    mock_genai_client.aio.models.generate_content_stream = AsyncMock(return_value=chunks())
+    history = [
         {"role": "user", "content": "Once upon a time"},
-        {"role": "model", "content": "there was a brave knight"},
+        {"role": "model", "content": "there was a knight"},
     ]
 
-    chunks = [chunk async for chunk in stream_chat_response(user_query, system_prompt, chat_history)]
+    [c async for c in stream_chat_response("Continue", "sys", history)]
 
-    assert chunks == ["history_chunk1", "history_chunk2"]
-    _, kwargs = mock_genai_client.aio.models.generate_content_stream.call_args
-    contents = kwargs['contents']
-    assert len(contents) == 4
-    assert contents[0].parts[0].text == system_prompt
-    assert contents[1].parts[0].text == "Once upon a time"
-    assert contents[2].role == "model"
-    assert contents[2].parts[0].text == "there was a brave knight"
-    assert contents[3].parts[0].text == user_query
+    contents = mock_genai_client.aio.models.generate_content_stream.call_args.kwargs["contents"]
+    assert [c.role for c in contents] == ["user", "model", "user"]
+    assert contents[-1].parts[0].text == "Continue"
+
 
 @pytest.mark.asyncio
-async def test_get_contextual_visualization_data_success(mock_genai_client):
-    mock_chat_session = AsyncMock()
-    mock_genai_client.aio.chats.create.return_value = mock_chat_session
-    mock_chat_session.send_message.return_value.text = (
-        '```json\n{\"type\": \"graph\", \"nodes\": [{\"id\": \"A\"}]}\n```'
-    )
+async def test_a_model_failure_raises_instead_of_becoming_the_answer(mock_genai_client):
+    """It used to yield "Error generating response." which was saved as the reply."""
+    mock_genai_client.aio.models.generate_content_stream = AsyncMock(side_effect=RuntimeError("503"))
 
-    user_query = "visualize graph"
-    chat_history = []
-    algorithm_context = "DFS algorithm"
+    with pytest.raises(GenerationError):
+        [c async for c in stream_chat_response("q", "sys", [])]
 
-    print("Calling get_contextual_visualization_data...")
-    result = await get_contextual_visualization_data(user_query, chat_history, algorithm_context)
-    print(f"Result: {result}")
 
-    print(f"Client calls: {mock_genai_client.mock_calls}")
-    print(f"Chat calls: {mock_chat_session.mock_calls}")
+# --- Suggestions -------------------------------------------------------------
 
-    mock_genai_client.aio.chats.create.assert_called_once()
-    # Note the extra newline due to how context_prompt is constructed in the app
-    expected_prompt_part = (
-        VISUALIZATION_PROMPT
-        + "\n\nAlgorithm Solution Context:\nDFS algorithm\n\n\nUser Request: visualize graph"
-    )
-    mock_chat_session.send_message.assert_called_once_with(expected_prompt_part)
-    assert result == {"type": "graph", "nodes": [{"id": "A"}]}
 
 @pytest.mark.asyncio
-@pytest.mark.asyncio
-async def test_get_contextual_visualization_data_with_chat_history(mock_genai_client):
-    mock_chat_session = AsyncMock()
-    mock_genai_client.aio.chats.create.return_value = mock_chat_session
-    mock_chat_session.send_message.return_value.text = '```json\n{\"type\": \"array\", \"data\": [5, 4, 3]}\n```'
+async def test_suggestions_come_back_parsed(mock_genai_client):
+    parsed = SuggestionList.model_validate({"suggestions": [{
+        "title": "Hash map lookup for [2,7]", "kind": "trace",
+        "trace": {"problem": "Two Sum", "input": "[2,7]", "approach": "hash map"},
+    }]})
+    mock_genai_client.aio.models.generate_content.return_value = response(parsed=parsed)
 
-    user_query = "visualize sorting"
-    chat_history = [
-        {"role": "user", "content": "Explain bubble sort"},
-        {"role": "model", "content": "Bubble sort is a simple sorting algorithm..."},
-        {"role": "user", "content": "Show me an example with [5,4,3]"},
+    result = await suggest_visualizations("two sum?", "Use a hash map.")
+
+    assert [s.title for s in result] == ["Hash map lookup for [2,7]"]
+    config = mock_genai_client.aio.models.generate_content.call_args.kwargs["config"]
+    assert config.response_schema is SuggestionList
+
+
+@pytest.mark.asyncio
+async def test_suggestion_failures_never_raise(mock_genai_client):
+    """Suggestions are an extra: a failure must not cost the user the answer."""
+    mock_genai_client.aio.models.generate_content.side_effect = RuntimeError("quota")
+    assert await suggest_visualizations("q", "a") == []
+
+
+@pytest.mark.asyncio
+async def test_unknown_builtin_keys_are_dropped_and_the_list_is_capped(mock_genai_client):
+    trace = {"problem": "p", "input": "i", "approach": "a"}
+    parsed = SuggestionList.model_validate({"suggestions": [
+        {"title": "Made up", "kind": "builtin", "builtin": {"key": "teleporter"}},
+        *[{"title": f"T{n}", "kind": "trace", "trace": trace} for n in range(4)],
+    ]})
+    mock_genai_client.aio.models.generate_content.return_value = response(parsed=parsed)
+
+    result = await suggest_visualizations("q", "a")
+
+    assert [s.title for s in result] == ["T0", "T1", "T2"]
+
+
+# --- Scenes ------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_valid_scene_is_returned(mock_genai_client):
+    mock_genai_client.aio.models.generate_content.return_value = response(json.dumps(VALID_SCENE))
+
+    scene = await generate_scene(TRACE, context="Q: two sum", language="java")
+
+    assert isinstance(scene, Scene)
+    kwargs = mock_genai_client.aio.models.generate_content.call_args.kwargs
+    assert kwargs["config"].response_schema is Scene
+    assert "java" in kwargs["config"].system_instruction
+    assert "Q: two sum" in kwargs["contents"][0].parts[0].text
+
+
+@pytest.mark.asyncio
+async def test_an_invalid_scene_is_retried_with_the_error(mock_genai_client):
+    bad = dict(VALID_SCENE, steps=[dict(VALID_SCENE["steps"][0], code_line=40)])
+    mock_genai_client.aio.models.generate_content.side_effect = [
+        response(json.dumps(bad)),
+        response(json.dumps(VALID_SCENE)),
     ]
-    algorithm_context = None
 
-    result = await get_contextual_visualization_data(user_query, chat_history, algorithm_context)
+    scene = await generate_scene(TRACE)
 
-    mock_genai_client.aio.chats.create.assert_called_once()
-    expected_recent_context = (
-        "Recent Conversation Context:\n"
-        "model: Bubble sort is a simple sorting algorithm......\n"
-        "user: Show me an example with [5,4,3]...\n"
-    )
-    expected_prompt_part = (
-        VISUALIZATION_PROMPT + "\n\n" + expected_recent_context
-        + "\n\nUser Request: visualize sorting"
-    )
-    # mock_chat_session.send_message.assert_called_once_with(expected_prompt_part)
-    mock_chat_session.send_message.assert_called_once()
-    actual_prompt = mock_chat_session.send_message.call_args[0][0]
-    assert actual_prompt == expected_prompt_part
-    assert result == {"type": "array", "data": [5, 4, 3]}
+    assert scene.steps[0].code_line == 1
+    retry_contents = mock_genai_client.aio.models.generate_content.call_args.kwargs["contents"]
+    assert [c.role for c in retry_contents] == ["user", "model", "user"]
+    assert "code line 40" in retry_contents[-1].parts[0].text
+
 
 @pytest.mark.asyncio
-@pytest.mark.asyncio
-async def test_get_contextual_visualization_data_invalid_json(mock_genai_client):
-    mock_chat_session = AsyncMock()
-    mock_genai_client.aio.chats.create.return_value = mock_chat_session
-    mock_chat_session.send_message.return_value.text = "Invalid JSON"
+async def test_two_invalid_scenes_give_up_with_a_readable_error(mock_genai_client):
+    mock_genai_client.aio.models.generate_content.return_value = response("{not json")
 
-    user_query = "visualize this"
-    result = await get_contextual_visualization_data(user_query)
+    with pytest.raises(GenerationError, match="valid visualization"):
+        await generate_scene(TRACE)
+    assert mock_genai_client.aio.models.generate_content.await_count == 2
 
-    assert result is None
 
 @pytest.mark.asyncio
-@pytest.mark.asyncio
-async def test_get_contextual_visualization_data_exception(mock_genai_client):
-    mock_genai_client.aio.chats.create.side_effect = Exception("Contextual API error")
+async def test_an_unavailable_model_is_reported(mock_genai_client):
+    mock_genai_client.aio.models.generate_content.side_effect = RuntimeError("down")
 
-    user_query = "visualize this"
-    result = await get_contextual_visualization_data(user_query)
+    with pytest.raises(GenerationError, match="unavailable"):
+        await generate_scene(TRACE)
 
-    assert result is None
+
+def test_no_builtins_means_the_prompt_says_trace_only():
+    assert "none available" in gemini_integration._builtins_text()

@@ -27,10 +27,34 @@ VALID_SCENE = {
 
 
 @pytest.fixture(autouse=True)
-def mock_genai_client():
+def no_retry_pause():
+    """Retries back off with real sleeps; tests shouldn't wait for them."""
+    with patch("app.llm.gemini_integration.asyncio.sleep", AsyncMock()) as sleep:
+        yield sleep
+
+
+@pytest.fixture(autouse=True)
+def mock_genai_client(monkeypatch):
+    monkeypatch.setattr(gemini_integration, "_discovered", None)
     with patch("app.llm.gemini_integration.client") as mock_client:
         mock_client.aio.models.generate_content = AsyncMock()
+        # By default the key lists no models, so discovery adds nothing.
+        mock_client.aio.models.list = AsyncMock(return_value=pager([]))
         yield mock_client
+
+
+def model(name, actions=("generateContent",)):
+    m = MagicMock()
+    m.name = f"models/{name}"
+    m.supported_actions = list(actions)
+    return m
+
+
+def pager(models):
+    async def it():
+        for m in models:
+            yield m
+    return it()
 
 
 def response(text="", parsed=None):
@@ -114,7 +138,8 @@ async def test_traces_use_the_scene_model_not_the_answer_model(mock_genai_client
     await generate_scene(CONTEXT)
     used = mock_genai_client.aio.models.generate_content.call_args.kwargs["model"]
     assert used == gemini_integration.SCENE_MODEL
-    assert used == "gemini-2.5-flash"
+    # 2.5-flash is refused to new keys (404 "no longer available to new users").
+    assert used == "gemini-3.8-flash"
 
 
 @pytest.mark.asyncio
@@ -204,18 +229,23 @@ async def test_a_refused_schema_falls_back_to_plain_json(mock_genai_client):
 
 
 @pytest.mark.asyncio
-async def test_an_unavailable_scene_model_falls_back_to_the_answer_model(mock_genai_client):
+async def test_a_missing_scene_model_goes_straight_to_the_answer_model(mock_genai_client):
+    """Skip a model that 404s.
+
+    A 404 means the model doesn't exist for this key; asking it again in JSON
+    mode (as the first fallback did) only adds a wasted round trip.
+    """
     mock_genai_client.aio.models.generate_content.side_effect = [
-        RuntimeError("404 model not found"),
-        RuntimeError("404 model not found"),
+        RuntimeError("404 NOT_FOUND. models/gemini-2.5-flash is no longer available to new users"),
         response(feasible()),
     ]
 
     result = await generate_scene(CONTEXT)
 
     assert result.feasible
-    third = mock_genai_client.aio.models.generate_content.call_args_list[2].kwargs
-    assert third["model"] == gemini_integration.DEFAULT_MODEL
+    calls = mock_genai_client.aio.models.generate_content.call_args_list
+    assert len(calls) == 2
+    assert calls[1].kwargs["model"] == gemini_integration.DEFAULT_MODEL
 
 
 @pytest.mark.asyncio
@@ -240,3 +270,131 @@ def test_the_fallback_order_has_no_duplicates_when_models_match(monkeypatch):
     monkeypatch.setattr(gemini_integration, "SCENE_MODEL", gemini_integration.DEFAULT_MODEL)
     attempts = gemini_integration._scene_attempts()
     assert attempts == [(gemini_integration.DEFAULT_MODEL, True), (gemini_integration.DEFAULT_MODEL, False)]
+
+
+# --- Transient failures (429/5xx) are retried ---------------------------------
+
+
+def overloaded():
+    return RuntimeError("503 UNAVAILABLE. This model is currently experiencing high demand.")
+
+
+@pytest.mark.asyncio
+async def test_an_overloaded_model_is_retried_before_falling_back(mock_genai_client, no_retry_pause):
+    mock_genai_client.aio.models.generate_content.side_effect = [overloaded(), response(feasible())]
+
+    result = await generate_scene(CONTEXT)
+
+    assert result.feasible
+    calls = mock_genai_client.aio.models.generate_content.call_args_list
+    assert [c.kwargs["model"] for c in calls] == [gemini_integration.SCENE_MODEL] * 2
+    assert calls[1].kwargs["config"].response_schema is SceneResult  # same mode, not a fallback
+    no_retry_pause.assert_awaited_once_with(1.0)
+
+
+@pytest.mark.asyncio
+async def test_retries_are_bounded(mock_genai_client, no_retry_pause):
+    mock_genai_client.aio.models.generate_content.side_effect = overloaded()
+
+    with pytest.raises(GenerationError, match="unavailable"):
+        await generate_scene(CONTEXT)
+
+    # Three ways of asking, each tried three times (two retries).
+    assert mock_genai_client.aio.models.generate_content.await_count == 9
+    assert [c.args[0] for c in no_retry_pause.await_args_list[:2]] == [1.0, 3.0]
+
+
+@pytest.mark.asyncio
+async def test_a_permanent_error_is_not_retried(mock_genai_client, no_retry_pause):
+    mock_genai_client.aio.models.generate_content.side_effect = [
+        RuntimeError("400 INVALID_ARGUMENT"),
+        response(feasible()),
+    ]
+    await generate_scene(CONTEXT)
+    no_retry_pause.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_the_answer_stream_is_retried_when_it_fails_before_any_text(mock_genai_client):
+    async def chunks():
+        yield MagicMock(text="hello")
+
+    mock_genai_client.aio.models.generate_content_stream = AsyncMock(side_effect=[overloaded(), chunks()])
+
+    out = [c async for c in stream_chat_response("q", "sys", [])]
+
+    assert out == ["hello"]
+
+
+@pytest.mark.asyncio
+async def test_the_answer_stream_is_not_retried_after_text_was_sent(mock_genai_client):
+    """A retry then would repeat text the user already has."""
+    async def breaks_midway():
+        yield MagicMock(text="half an ")
+        raise overloaded()
+
+    mock_genai_client.aio.models.generate_content_stream = AsyncMock(return_value=breaks_midway())
+
+    out = []
+    with pytest.raises(GenerationError):
+        async for c in stream_chat_response("q", "sys", []):
+            out.append(c)
+
+    assert out == ["half an "]
+    assert mock_genai_client.aio.models.generate_content_stream.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_intent_classification_survives_one_overload(mock_genai_client):
+    gemini_integration._intent_cache.clear()
+    mock_genai_client.aio.models.generate_content.side_effect = [overloaded(), response("cs_tutor")]
+
+    assert await gemini_integration.classify_intent_with_llm("explain two sum") == "cs_tutor"
+
+
+# --- Discovering models when the configured ones are gone ----------------------
+
+
+@pytest.mark.asyncio
+async def test_when_configured_models_are_refused_a_listed_model_is_used(mock_genai_client):
+    """Model names get retired; the key's own model list is the last resort."""
+    mock_genai_client.aio.models.list.return_value = pager([
+        model("gemini-2.5-flash-lite"),
+        model("gemini-9.1-flash"),
+        model("gemini-9.1-flash-tts"),
+        model("text-embedding-004", actions=("embedContent",)),
+        model("gemini-9.1-pro"),
+    ])
+    mock_genai_client.aio.models.generate_content.side_effect = [
+        RuntimeError("404 retired"),  # scene model
+        RuntimeError("404 retired"),  # answer model
+        response(feasible()),
+    ]
+
+    result = await generate_scene(CONTEXT)
+
+    assert result.feasible
+    used = [c.kwargs["model"] for c in mock_genai_client.aio.models.generate_content.call_args_list]
+    assert used[-1] == "gemini-9.1-flash"
+
+
+def test_discovered_models_are_newest_first_and_skip_lite():
+    names = ["gemini-2.0-flash", "gemini-3.8-flash-lite", "gemini-3.8-flash", "gemini-3.8-flash-preview"]
+    assert sorted(names, key=gemini_integration._version_key) == [
+        "gemini-3.8-flash", "gemini-3.8-flash-preview", "gemini-3.8-flash-lite", "gemini-2.0-flash",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_failed_model_listing_still_reports_unavailable(mock_genai_client):
+    mock_genai_client.aio.models.list.side_effect = RuntimeError("403")
+    mock_genai_client.aio.models.generate_content.side_effect = RuntimeError("404 gone")
+    with pytest.raises(GenerationError, match="unavailable"):
+        await generate_scene(CONTEXT)
+
+
+@pytest.mark.asyncio
+async def test_overload_is_named_as_the_cause(mock_genai_client):
+    mock_genai_client.aio.models.generate_content.side_effect = RuntimeError("503 high demand")
+    with pytest.raises(GenerationError, match="overloaded"):
+        await generate_scene(CONTEXT)

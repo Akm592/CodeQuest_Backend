@@ -42,8 +42,11 @@ class Settings:
         self.GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
         # Traces are generated only when someone clicks "Visualize this", so
         # they can afford a stronger model than every answer can. The lighter
-        # model slipped on cross-references in bigger traces.
-        self.GEMINI_SCENE_MODEL: str = os.getenv("GEMINI_SCENE_MODEL", "gemini-2.5-flash")
+        # model slipped on cross-references in bigger traces. gemini-2.5-flash
+        # was the first default; the API now refuses it to new keys (404, "no
+        # longer available to new users") and names gemini-3.8-flash instead.
+        # Override in the environment when this one is retired in turn.
+        self.GEMINI_SCENE_MODEL: str = os.getenv("GEMINI_SCENE_MODEL", "gemini-3.8-flash")
         # Download the LeetCode problem list at startup, in the background, so
         # the first coding question after a restart doesn't wait on it.
         self.WARM_LEETCODE_CACHE: bool = os.getenv("WARM_LEETCODE_CACHE", "true").lower() == "true"

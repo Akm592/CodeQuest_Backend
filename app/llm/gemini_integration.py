@@ -1,6 +1,8 @@
+import asyncio
 import json
+import re
 import time
-from typing import AsyncGenerator, Dict, List, Optional, Tuple
+from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
 
 from google import genai
 from google.genai import types
@@ -20,6 +22,38 @@ SCENE_MODEL = settings.GEMINI_SCENE_MODEL
 
 class GenerationError(Exception):
     """The model could not produce a usable answer. The message is safe to show."""
+
+
+# Statuses that mean "try again shortly": rate limited or overloaded. Google
+# returns 503 "This model is currently experiencing high demand... usually
+# temporary" during spikes, and treating that as final failed requests that a
+# second attempt would have served.
+TRANSIENT_STATUSES = {429, 500, 503, 504}
+RETRY_DELAYS_S = (1.0, 3.0)
+
+
+def _status(error: Exception) -> Optional[int]:
+    """Return an API error's HTTP status: its ``code``, else a leading "503 ..."."""
+    code = getattr(error, "code", None)
+    if isinstance(code, int):
+        return code
+    match = re.match(r"\s*(\d{3})\b", str(error))
+    return int(match.group(1)) if match else None
+
+
+async def _generate(model: str, contents: Any, config: types.GenerateContentConfig, label: str):
+    """Call generate_content, retrying transient failures with a short backoff."""
+    for attempt, delay in enumerate((*RETRY_DELAYS_S, None)):
+        try:
+            return await client.aio.models.generate_content(
+                model=model, contents=contents, config=config
+            )
+        except Exception as e:
+            status = _status(e)
+            if status not in TRANSIENT_STATUSES or delay is None:
+                raise
+            logger.warning(f"{label}: {model} returned {status}; retry {attempt + 1} in {delay:.0f}s")
+            await asyncio.sleep(delay)
 
 
 chat_config_defaults = dict(
@@ -72,18 +106,31 @@ async def stream_chat_response(
         system_instruction=system_prompt or None,
     )
 
-    try:
-        response = await client.aio.models.generate_content_stream(
-            model=DEFAULT_MODEL,
-            contents=contents,
-            config=config,
-        )
-        async for chunk in response:
-            if chunk.text:
-                yield chunk.text
-    except Exception as e:
-        logger.error(f"Streaming error: {str(e)}")
-        raise GenerationError("The model could not generate a response.") from e
+    for attempt, delay in enumerate((*RETRY_DELAYS_S, None)):
+        sent = False
+        try:
+            response = await client.aio.models.generate_content_stream(
+                model=DEFAULT_MODEL,
+                contents=contents,
+                config=config,
+            )
+            async for chunk in response:
+                if chunk.text:
+                    sent = True
+                    yield chunk.text
+            return
+        except Exception as e:
+            status = _status(e)
+            # Retry only if nothing has been shown yet: after the first chunk,
+            # a retry would repeat text the user already has.
+            if not sent and status in TRANSIENT_STATUSES and delay is not None:
+                logger.warning(
+                    f"Answer: {DEFAULT_MODEL} returned {status}; retry {attempt + 1} in {delay:.0f}s"
+                )
+                await asyncio.sleep(delay)
+                continue
+            logger.error(f"Streaming error: {str(e)}")
+            raise GenerationError("The model could not generate a response.") from e
 
 
 def _scene_request_text(context: str, trace: Optional[TraceRequest]) -> str:
@@ -118,6 +165,46 @@ def _scene_attempts() -> List[Tuple[str, bool]]:
             seen.add(attempt)
             ordered.append(attempt)
     return ordered
+
+
+# Models found by asking the API, cached for the process. Model names are
+# retired with little notice (gemini-2.5-flash started returning 404 for new
+# keys), so when every configured model is refused, the scene call asks which
+# models this key can actually use instead of failing.
+_discovered: Optional[List[str]] = None
+MAX_DISCOVERED = 3
+_SKIP_WORDS = ("tts", "image", "audio", "live", "embed", "vision", "thinking-exp", "learnlm", "gemma")
+
+
+def _version_key(name: str) -> Tuple:
+    """Sort newest first: higher version, then non-lite, then stable over preview."""
+    match = re.search(r"(\d+(?:\.\d+)?)", name)
+    version = float(match.group(1)) if match else 0.0
+    return (-version, "lite" in name, "preview" in name or "exp" in name, name)
+
+
+async def _discover_models() -> List[str]:
+    """Text-generation "flash" models this key can use, newest first. [] on failure."""
+    global _discovered
+    if _discovered:
+        return _discovered
+    try:
+        names = []
+        async for model in await client.aio.models.list():
+            name = (model.name or "").removeprefix("models/")
+            actions = model.supported_actions or []
+            if (
+                "flash" in name
+                and "generateContent" in actions
+                and not any(word in name for word in _SKIP_WORDS)
+            ):
+                names.append(name)
+    except Exception as e:
+        logger.error(f"Could not list Gemini models: {e}")
+        return []
+    _discovered = sorted(set(names), key=_version_key)[:MAX_DISCOVERED]
+    logger.info(f"Gemini models available to this key: {_discovered}")
+    return _discovered
 
 
 def _scene_config(language: str, structured: bool) -> types.GenerateContentConfig:
@@ -160,20 +247,34 @@ async def generate_scene(
     request = types.Content(role="user", parts=[types.Part(text=_scene_request_text(context, trace))])
     refusals: List[str] = []
     last_invalid: Optional[str] = None
+    missing: set = set()
+    statuses: List[Optional[int]] = []
+    attempts = _scene_attempts()
+    tried = {model for model, _ in attempts}
+    discovered = False
 
-    for model, structured in _scene_attempts():
+    while attempts:
+        model, structured = attempts.pop(0)
+        if not attempts and not discovered:
+            # About to try the last configured way; queue models the key
+            # really has, in case this one is refused too.
+            discovered = True
+            attempts.extend((m, False) for m in await _discover_models() if m not in tried)
+        if model in missing:
+            continue  # it 404ed: asking it again in another mode can't help
         mode = f"{model} ({'schema' if structured else 'json'})"
         config = _scene_config(language, structured)
         contents: List[types.Content] = [request]
 
         for repair in range(2):
             try:
-                response = await client.aio.models.generate_content(
-                    model=model, contents=contents, config=config
-                )
+                response = await _generate(model, contents, config, "Scene")
             except Exception as e:
                 refusals.append(f"{mode}: {e}")
+                statuses.append(_status(e))
                 logger.error(f"Scene generation call failed with {mode}: {e}")
+                if _status(e) == 404:
+                    missing.add(model)
                 break  # this way of asking is refused; try the next one
 
             raw = response.text or ""
@@ -208,6 +309,11 @@ async def generate_scene(
             raise GenerationError(f"Couldn't build a valid visualization ({last_invalid}).")
 
     logger.error(f"Every way of generating a scene was refused: {' | '.join(refusals)}")
+    if statuses and all(s in TRANSIENT_STATUSES for s in statuses):
+        raise GenerationError(
+            "The visualization service is unavailable right now: Google's models are "
+            "overloaded. Try again in a minute."
+        )
     raise GenerationError("The visualization service is unavailable right now.")
 
 
@@ -234,11 +340,7 @@ async def classify_intent_with_llm(user_query: str) -> str:
         start_time = time.perf_counter()
         prompt = INTENT_CLASSIFICATION_PROMPT.format(user_query=user_query)
 
-        response = await client.aio.models.generate_content(
-            model=DEFAULT_MODEL,
-            contents=prompt,
-            config=classification_config,
-        )
+        response = await _generate(DEFAULT_MODEL, prompt, classification_config, "Intent")
 
         intent = response.text.strip().lower()
         duration = time.perf_counter() - start_time
